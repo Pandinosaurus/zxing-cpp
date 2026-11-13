@@ -1,23 +1,13 @@
-#pragma once
 /*
 * Copyright 2016 Nu-book Inc.
 * Copyright 2016 ZXing authors
 * Copyright 2021 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
-#include "ReadBarcode.h"
+#pragma once
+
+#include "ImageView.h"
 
 #include <cstdint>
 #include <memory>
@@ -37,6 +27,8 @@ class BinaryBitmap
 {
 	struct Cache;
 	std::unique_ptr<Cache> _cache;
+	bool _inverted = false;
+	bool _closed = false;
 
 protected:
 	const ImageView _buffer;
@@ -47,6 +39,8 @@ protected:
 	* @return The 2D array of bits for the image, nullptr on error.
 	*/
 	virtual std::shared_ptr<const BitMatrix> getBlackMatrix() const = 0;
+
+	BitMatrix binarize(uint8_t threshold) const;
 
 public:
 	BinaryBitmap(const ImageView& buffer);
@@ -60,7 +54,13 @@ public:
 	*/
 	virtual bool getPatternRow(int row, int rotation, PatternRow& res) const = 0;
 
-	const BitMatrix* getBitMatrix() const;
+	const BitMatrix* getBitMatrix(bool transposed = false) const;
+
+	void invert();
+	bool inverted() const { return _inverted; }
+
+	void close();
+	bool closed() const { return _closed; }
 };
 
 } // ZXing

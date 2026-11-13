@@ -1,70 +1,112 @@
-cmake_minimum_required(VERSION 3.14)
+zxing_add_package(GTest googletest https://github.com/google/googletest.git v1.15.2)
 
-# Download and unpack googletest at configure time
-include(FetchContent)
-#set(FETCHCONTENT_QUIET Off)
-FetchContent_Declare (googletest
-        GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG v1.10.x)
-# Prevent overriding the parent project's compiler/linker settings on Windows
-set (gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable (googletest)
+if (GTest_POPULATED)
+    # don't install gtest stuff on "make install"
+    set (INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+endif()
 
-# don't install gtest stuff on "make install"
-set (INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+if (MSVC)
+    # default to UTF-8
+    add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
+endif()
 
-# Our executable
 add_executable (UnitTest
     BarcodeFormatTest.cpp
-    BitArrayUtility.h
     BitArrayUtility.cpp
-    PseudoRandom.h
-    BitHacksTest.cpp
+    BitArrayUtility.h
     CharacterSetECITest.cpp
+    ContentTest.cpp
+    ErrorTest.cpp
+    GTINTest.cpp
+    JSONTest.cpp
+    PseudoRandom.h
     ReedSolomonTest.cpp
-    TextDecoderTest.cpp
+    SanitizerSupport.cpp
     TextUtfEncodingTest.cpp
-    aztec/AZDetectorTest.cpp
-    aztec/AZDecoderTest.cpp
-    aztec/AZEncoderTest.cpp
-    aztec/AZEncodeDecodeTest.cpp
-    aztec/AZHighLevelEncoderTest.cpp
-    datamatrix/DMDecodedBitStreamParserTest.cpp
-    datamatrix/DMEncodeDecodeTest.cpp
-    datamatrix/DMHighLevelEncodeTest.cpp
-    datamatrix/DMPlacementTest.cpp
-    datamatrix/DMSymbolInfoTest.cpp
-    datamatrix/DMWriterTest.cpp
-    maxicode/MCDecoderTest.cpp
-    oned/ODCodaBarWriterTest.cpp
-    oned/ODCode39ExtendedModeTest.cpp
-    oned/ODCode39WriterTest.cpp
-    oned/ODCode93ReaderTest.cpp
-    oned/ODCode93WriterTest.cpp
-    oned/ODCode128ReaderTest.cpp
-    oned/ODCode128WriterTest.cpp
-    oned/ODEAN8WriterTest.cpp
-    oned/ODEAN13WriterTest.cpp
-    oned/ODITFWriterTest.cpp
-    oned/ODUPCAWriterTest.cpp
-    oned/ODUPCEWriterTest.cpp
-    oned/rss/ODRSSExpandedBinaryDecoderTest.cpp
-    qrcode/QRDataMaskTest.cpp
-    qrcode/QRDecodedBitStreamParserTest.cpp
-    qrcode/QREncoderTest.cpp
-    qrcode/QRErrorCorrectionLevelTest.cpp
-    qrcode/QRFormatInformationTest.cpp
-    qrcode/QRModeTest.cpp
-    qrcode/QRVersionTest.cpp
-    qrcode/QRWriterTest.cpp
-    pdf417/PDF417DecoderTest.cpp
-    pdf417/PDF417ErrorCorrectionTest.cpp
-    pdf417/PDF417HighLevelEncoderTest.cpp
-    pdf417/PDF417WriterTest.cpp
+    ZXAlgorithmsTest.cpp
 )
+
+if (ZXING_READERS)
+target_sources (UnitTest PRIVATE
+    PatternTest.cpp
+    TextDecoderTest.cpp
+    $<$<BOOL:${ZXING_ENABLE_1D}>:ThresholdBinarizerTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_AZTEC}>:aztec/AZDecoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_AZTEC}>:aztec/AZDetectorTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_DATAMATRIX}>:datamatrix/DMDecodedBitStreamParserTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_MAXICODE}>:maxicode/MCDecoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODCode128ReaderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODCode39ExtendedModeTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODCode39ReaderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODCode93ReaderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODDataBarExpandedBitDecoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODDataBarReaderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODTelepenReaderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_PDF417}>:pdf417/PDF417DecoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_PDF417}>:pdf417/PDF417ErrorCorrectionTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_PDF417}>:pdf417/PDF417ScanningDecoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/MQRDecoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QRBitMatrixParserTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QRDataMaskTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QRDecodedBitStreamParserTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QRErrorCorrectionLevelTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QRFormatInformationTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QRModeTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QRVersionTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/RMQRDecoderTest.cpp>
+)
+endif()
+
+if (ZXING_WRITERS MATCHES "OLD|BOTH")
+target_sources (UnitTest PRIVATE
+    $<$<BOOL:${ZXING_ENABLE_AZTEC}>:aztec/AZEncoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_DATAMATRIX}>:datamatrix/DMHighLevelEncodeTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_DATAMATRIX}>:datamatrix/DMPlacementTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_DATAMATRIX}>:datamatrix/DMSymbolInfoTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_DATAMATRIX}>:datamatrix/DMWriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODCode39WriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODCode93WriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODEAN13WriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODEAN8WriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODITFWriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODUPCAWriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODUPCEWriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_PDF417}>:pdf417/PDF417HighLevelEncoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_PDF417}>:pdf417/PDF417WriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QRWriterTest.cpp>
+)
+endif()
+
+if (ZXING_READERS AND ZXING_WRITERS MATCHES "OLD|BOTH")
+target_sources (UnitTest PRIVATE
+    $<$<BOOL:${ZXING_ENABLE_AZTEC}>:aztec/AZEncodeDecodeTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_AZTEC}>:aztec/AZHighLevelEncoderTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_DATAMATRIX}>:datamatrix/DMEncodeDecodeTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODCodaBarWriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_1D}>:oned/ODCode128WriterTest.cpp>
+    $<$<BOOL:${ZXING_ENABLE_QRCODE}>:qrcode/QREncoderTest.cpp>
+)
+endif()
+
+if (ZXING_READERS OR ZXING_WRITERS MATCHES "ON|NEW|BOTH")
+target_sources (UnitTest PRIVATE
+    GS1Test.cpp
+)
+endif()
+
+if (ZXING_WRITERS MATCHES "ON|NEW|BOTH")
+target_sources (UnitTest PRIVATE
+    CreateBarcodeTest.cpp
+    TextEncoderTest.cpp
+)
+endif()
 
 target_include_directories (UnitTest PRIVATE .)
 
-target_link_libraries (UnitTest ZXing::ZXing gtest_main gmock)
+target_compile_options (UnitTest PRIVATE -DZXING_INTERNAL)
 
-add_test(NAME UnitTest COMMAND UnitTest)
+target_link_libraries (UnitTest ZXing::ZXing GTest::gtest_main GTest::gmock)
+
+# target_precompile_headers(UnitTest PRIVATE ${CMAKE_SOURCE_DIR}/core/src/ZXingCpp.h) # <gtest/gtest.h>)
+
+add_test(NAME UnitTest COMMAND UnitTest --gtest_brief)

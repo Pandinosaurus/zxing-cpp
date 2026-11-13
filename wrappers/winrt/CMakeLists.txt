@@ -1,5 +1,5 @@
 #
-# This will create a Windows Runtime Component that can be consummed by any WinRT or UWP project.
+# This will create a Windows Runtime Component that can be consumed by any WinRT or UWP project.
 # You need to specify -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0 at command line
 # to generate correctly UWP projects. You can also use Toolchain-Win10.cmake as tool chain file
 # which defined these for you.
@@ -7,13 +7,14 @@
 # You can add EXTENSION_SDK_OUTPUT variable to deploy the build as UWP Extension SDK
 # e.g. -DEXTENSION_SDK_OUTPUT:STRING=<path_to_folder_parent_of_SDKManifest.xml>
 #
-cmake_minimum_required (VERSION 3.4.0)
+cmake_minimum_required (VERSION 3.16)
 
 project (ZXingWinRT)
 
 set (CMAKE_CONFIGURATION_TYPES "RelWithDebInfo;Release" CACHE STRING "" FORCE)
 set (WINRT ON)
 set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /INCREMENTAL:NO" )
+set (CMAKE_CXX_STANDARD 20) # does not work with /ZW, see https://learn.microsoft.com/en-us/cpp/build/reference/zw-windows-runtime-compilation?view=msvc-170
 
 add_definitions (-DUNICODE -D_UNICODE)
 
@@ -49,6 +50,7 @@ target_link_libraries (ZXingWinRT
 target_compile_options (ZXingWinRT PRIVATE
     -D_WINRT_DLL
     -ZW             # Consume Windows Runtime Extension
+                    # this is incompatible with c++20 (see https://learn.microsoft.com/en-us/cpp/build/reference/zw-windows-runtime-compilation?view=msvc-170)
 )
 
 set_target_properties (ZXingWinRT PROPERTIES

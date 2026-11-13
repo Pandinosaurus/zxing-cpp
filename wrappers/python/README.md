@@ -1,29 +1,66 @@
 # Python bindings for zxing-cpp
 
-[![Build + Deploy](https://github.com/nu-book/zxing-cpp/actions/workflows/python-build.yml/badge.svg)](https://github.com/nu-book/zxing-cpp/actions/workflows/python-build.yml)
 [![PyPI](https://img.shields.io/pypi/v/zxing-cpp.svg)](https://pypi.org/project/zxing-cpp/)
+
+The package uses [scikit-build-core](https://scikit-build-core.readthedocs.io/) as its build backend and [nanobind](https://nanobind.readthedocs.io/) for the Python bindings.
 
 ## Installation
 
 ```bash
 pip install zxing-cpp
 ```
-or
+
+To build from a checked out / extracted soruce tree, a suitable [build environment](https://github.com/zxing-cpp/zxing-cpp#build-instructions) including a C++20 compiler is required:
 
 ```bash
-python setup.py install
+pip install .
 ```
+
 
 ## Usage
 
-```python
-import cv2
-import zxingcpp
+### Reading barcodes
 
-img = cv2.imread('myimage.png')
-result = zxingcpp.read_barcode(img)
-if result.valid:
-    print("Found barcode with value '{}' (format: {})".format(result.text, str(result.format))) 
-else:
-    print("could not read barcode")
+```python
+import cv2, zxingcpp
+
+img = cv2.imread('test.png')
+barcodes = zxingcpp.read_barcodes(img)
+for barcode in barcodes:
+	print('Found barcode:'
+		f'\n Text:    "{barcode.text}"'
+		f'\n Format:   {barcode.format}'
+		f'\n Content:  {barcode.content_type}'
+		f'\n Position: {barcode.position}')
+if len(barcodes) == 0:
+	print("Could not find any barcode.")
 ```
+
+The `read_barcodes` function can accept images in various formats, including OpenCV, Pillow, and Qt images,
+as well as NumPy arrays with dtype `uint8`. Grayscale arrays can have shape `(height, width)` or
+`(height, width, 1)`. Three-channel arrays are interpreted as BGR, matching OpenCV's default `imread` output.
+To explicitly specify the image buffer memory layout including the number of channels, the shape and the stride
+of any given memory view / array, you can use the `ImageView` class:
+
+```python
+view = zxingcpp.ImageView(memoryview(img), width, height, zxingcpp.ImageFormat.RGBA, row_stride, pix_stride)
+barcodes = zxingcpp.read_barcodes(view)
+```
+
+### Writing barcodes
+
+```python
+import zxingcpp
+from PIL import Image
+
+barcode = zxingcpp.create_barcode('This is a test', zxingcpp.BarcodeFormat.QRCode, ec_level = "50%")
+
+img = barcode.to_image(scale = 5)
+Image.fromarray(img).save("test.png")
+
+svg = barcode.to_svg(add_quiet_zones = False)
+with open("test.svg", "w") as svg_file:
+	svg_file.write(svg)
+```
+
+To get a full list of available parameters for `read_barcodes` and `create_barcode` as well as the properties of the Barcode objects, have a look at the `nanobind` module definition in [this C++ source file](https://github.com/zxing-cpp/zxing-cpp/blob/master/wrappers/python/zxing.cpp).

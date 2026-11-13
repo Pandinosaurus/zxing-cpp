@@ -2,23 +2,14 @@
 * Copyright 2016 Huy Cuong Nguyen
 * Copyright 2016 ZXing authors
 * Copyright 2006 Jeremias Maerki
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PDFEncoder.h"
 #include "PDFHighLevelEncoder.h"
+#include "ReedSolomon.h"
 #include <array>
+#include <cmath>
 #include <vector>
 #include <stdexcept>
 
@@ -218,8 +209,9 @@ static const std::array<std::array<int, 929>, 3> CODEWORD_TABLE = {
 };
 
 static const float PREFERRED_RATIO = 3.0f;
-static const float DEFAULT_MODULE_WIDTH = 0.357f; //1px in mm
-static const float HEIGHT = 2.0f; //mm
+static const float MODULE_RATIO = 0.25f; // keep in sync with Writer::encode()
+
+#ifdef ZX_USE_SELFCONTAINED_RS_ENCODER
 
 /**
 * PDF417 error correction code following the algorithm described in ISO/IEC 15438:2001(E) in
@@ -297,9 +289,10 @@ static const short EC_COEFFICIENTS_L8[] = { 352,  77, 373, 504,  35, 599, 428, 2
 											407, 164, 332, 899, 165, 726, 600, 325, 498, 655, 357, 752, 768, 223, 849, 647,
 											 63, 310, 863, 251, 366, 304, 282, 738, 675, 410, 389, 244,  31, 121, 303, 263, };
 
-static const short* EC_COEFFICIENTS[] = {EC_COEFFICIENTS_L0, EC_COEFFICIENTS_L1, EC_COEFFICIENTS_L2,
-                                         EC_COEFFICIENTS_L3, EC_COEFFICIENTS_L4, EC_COEFFICIENTS_L5,
-                                         EC_COEFFICIENTS_L6, EC_COEFFICIENTS_L7, EC_COEFFICIENTS_L8};
+static const short* const EC_COEFFICIENTS[] = {EC_COEFFICIENTS_L0, EC_COEFFICIENTS_L1, EC_COEFFICIENTS_L2,
+										 EC_COEFFICIENTS_L3, EC_COEFFICIENTS_L4, EC_COEFFICIENTS_L5,
+										 EC_COEFFICIENTS_L6, EC_COEFFICIENTS_L7, EC_COEFFICIENTS_L8};
+#endif
 
 /**
 * Determines the number of error correction codewords for a specified error correction
@@ -316,13 +309,17 @@ static int GetErrorCorrectionCodewordCount(int errorCorrectionLevel)
 /**
 * Generates the error correction codewords according to 4.10 in ISO/IEC 15438:2001(E).
 *
-* @param dataCodewords        the data codewords
+* @param dataCodewords        the data codewords (including error correction after return)
 * @param errorCorrectionLevel the error correction level (0-8)
-* @return the String representing the error correction codewords
 */
 static void GenerateErrorCorrection(std::vector<int>& dataCodewords, int errorCorrectionLevel)
 {
 	int k = GetErrorCorrectionCodewordCount(errorCorrectionLevel);
+
+#ifndef ZX_USE_SELFCONTAINED_RS_ENCODER
+	dataCodewords.resize(dataCodewords.size() + k, 0);
+	ReedSolomonEncode(RSField::PDF417, dataCodewords, k);
+#else
 	std::vector<int> e(k, 0);
 	int sld = Size(dataCodewords);
 	for (int i = 0; i < sld; i++) {
@@ -344,8 +341,8 @@ static void GenerateErrorCorrection(std::vector<int>& dataCodewords, int errorCo
 		}
 	}
 	dataCodewords.insert(dataCodewords.end(), e.rbegin(), e.rend());
+#endif
 }
-
 
 /**
 * Calculates the necessary number of rows as described in annex Q of ISO/IEC 15438:2001(E).
@@ -457,7 +454,6 @@ static BarcodeMatrix EncodeLowLevel(const std::vector<int>& fullCodewords, int c
 *
 * @param sourceCodeWords number of code words
 * @param errorCorrectionCodeWords number of error correction code words
-* @return dimension object containing cols as width and rows as height
 */
 static void DetermineDimensions(int minCols, int maxCols, int minRows, int maxRows, int sourceCodeWords, int errorCorrectionCodeWords, int& outCols, int& outRows)
 {
@@ -476,7 +472,7 @@ static void DetermineDimensions(int minCols, int maxCols, int minRows, int maxRo
 			continue;
 		}
 
-		float newRatio = ((17 * cols + 69) * DEFAULT_MODULE_WIDTH) / (rows * HEIGHT);
+		float newRatio = ((17 * cols + 69) / rows) * MODULE_RATIO;
 
 		// ignore if previous ratio is closer to preferred ratio
 		if (haveDimension && std::abs(newRatio - PREFERRED_RATIO) > std::abs(ratio - PREFERRED_RATIO)) {

@@ -1,30 +1,13 @@
 /*
 * Copyright 2017 Axel Waggershauser
 * Copyright 2013 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "BitMatrixIO.h"
 #include "DecoderResult.h"
 #include "datamatrix/DMDecoder.h"
-#include "datamatrix/DMSymbolShape.h"
 #include "datamatrix/DMWriter.h"
-
-#include <algorithm>
-#ifndef NDEBUG
-#include <fstream>
-#endif
 
 #include "gtest/gtest.h"
 
@@ -38,7 +21,7 @@ namespace {
 		ASSERT_EQ(matrix.empty(), false);
 
 		DecoderResult res = DataMatrix::Decode(matrix);
-#ifndef NDEBUG
+#ifdef PRINT_DEBUG
 		if (!res.isValid() || data != res.text())
 			SaveAsPBM(matrix, "failed-datamatrix.pbm", 4);
 #endif

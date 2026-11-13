@@ -1,0 +1,47 @@
+// Copyright 2022 KURZ Digital Solutions GmbH
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#import "ZXIResult.h"
+
+@implementation ZXIResult
+- (instancetype)init:(NSString *)text
+              format:(ZXIFormat)format
+               bytes:(NSData *)bytes
+            position:(ZXIPosition *)position
+            rotation:(NSInteger)rotation
+             ecLevel:(NSString *)ecLevel
+ symbologyIdentifier:(NSString *)symbologyIdentifier
+               extra:(NSDictionary<NSString *, id> *)extra
+        sequenceSize:(NSInteger)sequenceSize
+       sequenceIndex:(NSInteger)sequenceIndex
+          sequenceId:(NSString *)sequenceId
+          readerInit:(BOOL)readerInit
+           lineCount:(NSInteger)lineCount
+                gtin:(ZXIGTIN *)gtin {
+    self = [super init];
+    self.text = text;
+    self.format = format;
+    self.bytes = bytes;
+    self.position = position;
+    self.rotation = rotation;
+    self.ecLevel = ecLevel;
+    self.symbologyIdentifier = symbologyIdentifier;
+    self.extra = extra;
+    self.sequenceSize = sequenceSize;
+    self.sequenceIndex = sequenceIndex;
+    self.sequenceId = sequenceId;
+    self.readerInit = readerInit;
+    self.lineCount = lineCount;
+    self.gtin = gtin;
+    return self;
+}
+
+- (NSInteger)orientation {
+   return self.rotation;
+}
+
+- (void)setOrientation:(NSInteger)orientation {
+   self.rotation = orientation;
+}
+@end

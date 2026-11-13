@@ -1,20 +1,11 @@
 /*
 * Copyright 2020 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "ODDataBarCommon.h"
+
+#include <cmath>
 
 namespace ZXing::OneD::DataBar {
 
@@ -45,7 +36,7 @@ static int combins(int n, int r)
 	return val;
 }
 
-int GetValue(const Array4I& widths, int maxWidth, bool noNarrow)
+int GetValue(ArrayView<int> widths, int maxWidth, bool noNarrow)
 {
 	int elements = Size(widths);
 	int n = Reduce(widths);
@@ -74,18 +65,19 @@ int GetValue(const Array4I& widths, int maxWidth, bool noNarrow)
 	return val;
 }
 
-template <typename T>
-struct OddEven
-{
-	T odd = {}, evn = {};
-	T& operator[](int i) { return i & 1 ? evn : odd; }
-};
-
 using Array4F = std::array<float, 4>;
 
 bool ReadDataCharacterRaw(const PatternView& view, int numModules, bool reversed, Array4I& oddPattern,
 						  Array4I& evnPattern)
 {
+#if 1
+	auto pattern = NormalizedPatternFromE2E<8>(view, numModules, reversed);
+	OddEven<Array4I&> res = {oddPattern, evnPattern};
+
+	for (int i = 0; i < Size(pattern); ++i)
+		res[i % 2][i / 2] = pattern[i];
+
+#else
 	OddEven<Array4I&> res = {oddPattern, evnPattern};
 	OddEven<Array4F> rem;
 
@@ -98,6 +90,7 @@ bool ReadDataCharacterRaw(const PatternView& view, int numModules, bool reversed
 		res[i % 2][i / 2] = int(v + .5f);
 		rem[i % 2][i / 2] = v - res[i % 2][i / 2];
 	}
+#endif
 
 	// DataBarExpanded data character is 17 modules wide
 	// DataBar outer   data character is 16 modules wide
@@ -118,8 +111,8 @@ bool ReadDataCharacterRaw(const PatternView& view, int numModules, bool reversed
 
 #if 0
 	// the 'signal improving' strategy of trying to fix off-by-one errors in the sum or parity leads to a massively
-	// increased likelyhood of false positives / misreads especially with expanded codes that are composed of many
-	// pairs. the combinatorial explosion of posible pair combinations (see FindValidSequence) results in many possible
+	// increased likelihood of false positives / misreads especially with expanded codes that are composed of many
+	// pairs. the combinatorial explosion of possible pair combinations (see FindValidSequence) results in many possible
 	// sequences with valid checksums. It can slightly lower the minimum required resolution to detect something at all
 	// but the introduced error rate is clearly not worth it.
 
@@ -155,12 +148,25 @@ bool ReadDataCharacterRaw(const PatternView& view, int numModules, bool reversed
 #endif
 }
 
+static bool IsStacked(const Pair& first, const Pair& last)
+{
+	// check if we see two halfes that are far away from each other in y or overlapping in x
+	return std::abs(first.y - last.y) > (first.xStop - first.xStart) || last.xStart < (first.xStart + first.xStop) / 2;
+}
+
 Position EstimatePosition(const Pair& first, const Pair& last)
 {
-	if (first.y == last.y)
-		return Line(first.y, first.xStart, last.xStop);
+	if (!IsStacked(first, last))
+		return Line((first.y + last.y) / 2, first.xStart, last.xStop);
 	else
 		return Position{{first.xStart, first.y}, {first.xStop, first.y}, {last.xStop, last.y}, {last.xStart, last.y}};
+}
+
+int EstimateLineCount(const Pair& first, const Pair& last)
+{
+	// see ODReader.cpp 'lineCount++' and Barcode::operator==() for the -2 here
+	// TODO: this is a bit of a hack... implement a proper Pair clustering
+	return std::max(0, std::min(first.count, last.count) - 2) + IsStacked(first, last);
 }
 
 } // namespace ZXing::OneD::DataBar

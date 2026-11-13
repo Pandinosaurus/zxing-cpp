@@ -2,49 +2,55 @@
 * Copyright 2016 Nu-book Inc.
 * Copyright 2016 ZXing authors
 * Copyright 2020 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
+* Copyright 2023 gitlost
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "QRDetector.h"
 
+#include "BitArray.h"
 #include "BitMatrix.h"
 #include "BitMatrixCursor.h"
 #include "ConcentricFinder.h"
-#include "DetectorResult.h"
 #include "GridSampler.h"
-#include "LogMatrix.h"
+#include "LocalGrid.h"
+#include "Log.h"
+#include "Matrix.h"
 #include "Pattern.h"
+#include "QRFormatInformation.h"
+#include "QRVersion.h"
 #include "Quadrilateral.h"
 #include "RegressionLine.h"
-
-#include "BitMatrixIO.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iterator>
 #include <map>
+#include <numbers>
 #include <utility>
 #include <vector>
 
+#ifdef PRINT_DEBUG
+#include "BitMatrixIO.h"
+#endif
+
 namespace ZXing::QRCode {
 
-constexpr auto PATTERN    = FixedPattern<5, 7>{1, 1, 3, 1, 1};
-constexpr int MIN_MODULES = 1 * 4 + 17; // version 1
-constexpr int MAX_MODULES = 40 * 4 + 17; // version 40
+constexpr auto PATTERN = FixedPattern<5, 7>{1, 1, 3, 1, 1};
+constexpr bool E2E = true;
 
-static auto FindFinderPatterns(const BitMatrix& image, bool tryHarder)
+PatternView FindPattern(const PatternView& view)
+{
+	return FindLeftGuard<PATTERN.size()>(view, PATTERN.size(), [](const PatternView& view, int spaceInPixel) {
+		// perform a fast plausibility test for 1:1:3:1:1 pattern
+		if (view[2] < 3 || view[2] < 2 * std::max(view[0], view[4]) || view[2] < std::max(view[1], view[3]))
+			return 0.;
+		return IsPattern<E2E>(view, PATTERN, spaceInPixel, 0.1); // the requires 4, here we accept almost 0
+	});
+}
+
+std::vector<ConcentricPattern> FindFinderPatterns(const BitMatrix& image, bool tryHarder)
 {
 	constexpr int MIN_SKIP         = 3;           // 1 pixel/module times 3 modules/center
 	constexpr int MAX_MODULES_FAST = 20 * 4 + 17; // support up to version 20 for mobile clients
@@ -59,21 +65,25 @@ static auto FindFinderPatterns(const BitMatrix& image, bool tryHarder)
 		skip = MIN_SKIP;
 
 	std::vector<ConcentricPattern> res;
+	[[maybe_unused]] int N = 0;
+	PatternRow row;
 
 	for (int y = skip - 1; y < height; y += skip) {
-		PatternRow row;
-		image.getPatternRow(y, row);
+		GetPatternRow(image, y, row, false);
 		PatternView next = row;
 
-		while (next = FindLeftGuard(next, 0, PATTERN, 0.5), next.isValid()) {
+		while (next = FindPattern(next), next.isValid()) {
 			PointF p(next.pixelsInFront() + next[0] + next[1] + next[2] / 2.0, y + 0.5);
 
 			// make sure p is not 'inside' an already found pattern area
 			if (FindIf(res, [p](const auto& old) { return distance(p, old) < old.size / 2; }) == res.end()) {
-				auto pattern = LocateConcentricPattern(image, PATTERN, p,
-													   Reduce(next) * 3 / 2); // 1.5 for very skewed samples
-				if (pattern) {
-					log(*pattern, 3);
+				log(p);
+				N++;
+				auto width = 2 * next.sum(); // the factor 2 allows for a maximum aspect ratio of 4:1 due to perspective distortion
+				auto pattern = LocateConcentricPattern<E2E>(image, PATTERN, p, width);
+				if (pattern && !Contains(res, *pattern)) {
+					log(*pattern, LOG_B, 2);
+					assert(image.get(pattern->x, pattern->y));
 					res.push_back(*pattern);
 				}
 			}
@@ -84,121 +94,253 @@ static auto FindFinderPatterns(const BitMatrix& image, bool tryHarder)
 		}
 	}
 
+	log_l("FPs: FindPattern: %d, LocateConcentric: %d", N, Size(res));
+
 	return res;
 }
-
-struct FinderPatternSet
-{
-	ConcentricPattern bl, tl, tr;
-};
-
-using FinderPatternSets = std::vector<FinderPatternSet>;
 
 /**
  * @brief GenerateFinderPatternSets
  * @param patterns list of ConcentricPattern objects, i.e. found finder pattern squares
  * @return list of plausible finder pattern sets, sorted by decreasing plausibility
  */
-static FinderPatternSets GenerateFinderPatternSets(std::vector<ConcentricPattern>&& patterns)
+FinderPatternSets GenerateFinderPatternSets(FinderPatterns& patterns)
 {
-	std::sort(patterns.begin(), patterns.end(), [](const auto& a, const auto& b) { return a.size < b.size; });
+	std::sort(patterns.begin(), patterns.end(), [](const auto& a, const auto& b) { return a.size > b.size; });
+
+	struct {
+		int rejSize = 0;
+		int nearFPs = 0;
+		int candidates = 0;
+		int rejLegRatio = 0;
+		int rejModCount = 0;
+		int rejAngle = 0;
+		int accepted = 0;
+	} stats;
 
 	auto sets            = std::multimap<double, FinderPatternSet>();
-	auto squaredDistance = [](PointF a, PointF b) { return dot((a - b), (a - b)); };
+	auto squaredDistance = [](const auto* a, const auto* b) {
+		// The scaling of the distance based on the b/a size ratio is a very coarse compensation for the shortening effect of
+		// the camera projection on slanted symbols. The fact that the size of the finder pattern is proportional to the
+		// distance from the camera is used here. This approximation only works if a < b < 2*a (see below).
+		// Test image: fix-finderpattern-order.jpg
+		// Originally, I scaled the squaredDistance with the (b/a)^2 ratio but that could skew the cosine calculation
+		// below too much, resulting in the acceptance of degenerate triangles (a, b and c on a line).
+		return dot((*a - *b), (*a - *b)) * double(b->size) / a->size;
+	};
+	const double cosUpper = std::cos(60. / 180 * std::numbers::pi);
+	const double cosLower = std::cos(120. / 180 * std::numbers::pi);
+
+#if 1
+	if (Size(patterns) < 3)
+		return {};
+
+	// Bin finder patterns into spatial bins to reduce the number of candidates to compare with geometry heuristics below.
+	// For each finder pattern, we only compare it to patterns in bins that are not further away than the largest symbol (177 modules)
+	// can occupy.  We search from inside out and stop after we found a limited number of candidates which reduces the complexity from
+	// O(n^3) to O(n). E.g. a sample with 140 small QRCodes has 420 finder patterns, which results in 12 million candidates to process
+	// while with the binning, we only compare 20k candidates -> total runtime goes from 190ms to 9ms.
+	auto [mX, MX] = std::ranges::minmax_element(patterns, {}, &PointF::x);
+	auto [mY, MY] = std::ranges::minmax_element(patterns, {}, &PointF::y);
+	int medianSize = patterns[Size(patterns) / 2].size;
+	int binSize = std::max(32, medianSize * 3); // 3 for minimum symbol size of 21 modules
+	Matrix<std::vector<int>> bins(std::ceil((MX->x - mX->x + 1) / binSize), std::ceil((MY->y - mY->y + 1) / binSize));
+
+	log_t("medianSize=%d binSize=%d bins=(%dx%d) ", medianSize, binSize, bins.width(), bins.height());
+
+	auto bin = [&](PointF p) {
+		return PointI(std::clamp(int((p.x - mX->x) / binSize), 0, bins.width() - 1),
+					  std::clamp(int((p.y - mY->y) / binSize), 0, bins.height() - 1));
+	};
+
+	for (int idx = 0; idx < Size(patterns); ++idx)
+		bins(bin(patterns[idx])).push_back(idx);
+
+	constexpr double maxModuleCount = 177 * 1.5;
+	// manually tuned to work with e.g. https://github.com/eventualbuddha/zedbar/blob/f0d9d9fa6158c108a21f7cde42c0339fb32dff69/examples/qr-code-140-grid02.jpg
+	constexpr size_t maxCandidates = 15;
+	auto candidates = std::vector<int>();
+	candidates.reserve(maxCandidates * 2);
+
+	int nbPatterns = Size(patterns);
+	bool useFilters = nbPatterns > 5; // for a small number of patterns, we apply no/less filters (like size ratio, leg ratio, angle)
+	for (int i = 0; i < nbPatterns - 2; i++) {
+		const auto* c0 = &patterns[i];
+		double maxDistToC = c0->size / 7.0 * maxModuleCount;
+		auto cBin = bin(*c0);
+		int binRadius = std::ceil(maxDistToC / binSize);
+		candidates.clear();
+
+		for (auto d : Spiral(binRadius)) {
+			auto b = cBin + d;
+			if (b.x < 0 || b.x >= bins.width() || b.y < 0 || b.y >= bins.height())
+				continue;
+
+			for (int idx : bins(b)) {
+				if (idx <= i)
+					continue;
+
+				const auto* p = &patterns[idx];
+				if (useFilters && c0->size > p->size * 2 + 2) {
+					stats.rejSize++;
+					continue;
+				}
+
+				candidates.push_back(idx);
+				stats.nearFPs++;
+			}
+
+			if (candidates.size() >= maxCandidates)
+				break;
+		}
+
+		for (int u = 0; u < Size(candidates) - 1; ++u) {
+			for (int v = u + 1; v < Size(candidates); ++v) {
+				stats.candidates++;
+				int j = candidates[u];
+				int k = candidates[v];
+
+				// patterns is sorted descending by size (the larger the pattern, the less likely is it noise),
+				// but the geometry/size heuristics below assume a <= b <= c in size. Keep that convention by remapping indices.
+				const auto* a = &patterns[std::max(j, k)];
+				const auto* b = &patterns[std::min(j, k)];
+				const auto* c = c0;
+
+#else
 
 	int nbPatterns = Size(patterns);
 	for (int i = 0; i < nbPatterns - 2; i++) {
 		for (int j = i + 1; j < nbPatterns - 1; j++) {
 			for (int k = j + 1; k < nbPatterns - 0; k++) {
-				const auto* a = &patterns[i];
+				stats.candidates++;
+				// patterns is sorted descending by size (the larger the pattern, the less likely is it noise),
+				// but the geometry/size heuristics below assume a <= b <= c in size. Keep that convention by remapping i/j/k.
+				const auto* a = &patterns[k];
 				const auto* b = &patterns[j];
-				const auto* c = &patterns[k];
+				const auto* c = &patterns[i];
+
 				// if the pattern sizes are too different to be part of the same symbol, skip this
 				// and the rest of the innermost loop (sorted list)
 				if (c->size > a->size * 2)
 					break;
+#endif
 
 				// Orders the three points in an order [A,B,C] such that AB is less than AC
 				// and BC is less than AC, and the angle between BC and BA is less than 180 degrees.
 
-				auto distAB = squaredDistance(*a, *b);
-				auto distBC = squaredDistance(*b, *c);
-				auto distAC = squaredDistance(*a, *c);
+				auto distAB2 = squaredDistance(a, b);
+				auto distBC2 = squaredDistance(b, c);
+				auto distAC2 = squaredDistance(a, c);
 
-				if (distBC >= distAB && distBC >= distAC) {
+				if (distBC2 >= distAB2 && distBC2 >= distAC2) {
 					std::swap(a, b);
-					std::swap(distBC, distAC);
-				} else if (distAB >= distAC && distAB >= distBC) {
+					std::swap(distBC2, distAC2);
+				} else if (distAB2 >= distAC2 && distAB2 >= distBC2) {
 					std::swap(b, c);
-					std::swap(distAB, distAC);
+					std::swap(distAB2, distAC2);
 				}
 
-				// Estimate the module count and ignore this set if it can not result in a valid decoding
-				if (auto moduleCount =
-						(std::sqrt(distAB) + std::sqrt(distBC)) / (2 * (a->size + b->size + c->size) / (3 * 7.f)) + 7;
-					moduleCount < 21 * 0.9 || moduleCount > 177 * 1.05)
+				// Make sure distAB and distBC don't differ more than reasonable:
+				// equivalent to distAB > 2 * distBC || distBC > 2 * distAB but avoids sqrt.
+				// TODO: make sure the constant 2 is not too conservative for reasonably tilted symbols
+				int maxRatio = useFilters ? 4 : 8; // be more tolerant but still reject degenerate triangles (especially duplicate FPs)
+				if (distAB2 > maxRatio * distBC2 || distBC2 > maxRatio * distAB2) {
+					stats.rejLegRatio++;
 					continue;
+				}
+
+				auto distAB = std::sqrt(distAB2);
+				auto distBC = std::sqrt(distBC2);
+
+				// Estimate the module count and ignore this set if it can not result in a valid decoding
+				if (auto moduleCount = (distAB + distBC) / (2 * (a->size + b->size + c->size) / (3 * 7.f)) + 7;
+					moduleCount < 21 * 0.9 || moduleCount > 177 * 1.5) { // moduleCount may be overestimated, see above
+					stats.rejModCount++;
+					continue;
+				}
+
+				// Make sure the angle between AB and BC does not deviate from 90° too much
+				auto cosAB_BC = (distAB2 + distBC2 - distAC2) / (2 * distAB * distBC);
+				if (useFilters && (std::isnan(cosAB_BC) || cosAB_BC > cosUpper || cosAB_BC < cosLower)) {
+					stats.rejAngle++;
+					continue;
+				}
 
 				// a^2 + b^2 = c^2 (Pythagorean theorem), and a = b (isosceles triangle).
 				// Since any right triangle satisfies the formula c^2 - b^2 - a^2 = 0,
 				// we need to check both two equal sides separately.
 				// The value of |c^2 - 2 * b^2| + |c^2 - 2 * a^2| increases as dissimilarity
 				// from isosceles right triangle.
-				double d = std::abs(distAC - 2 * distAB) + std::abs(distAC - 2 * distBC);
+				// double score = (std::abs(distAC2 - 2 * distAB2) + std::abs(distAC2 - 2 * distBC2));
 
-				// Use cross product to figure out whether A and C are correct or flipped.
-				// This asks whether BC x BA has a positive z component, which is the arrangement
-				// we want for A, B, C. If it's negative then swap A and C.
-				if (cross(*c - *b, *a - *b) < 0)
-					std::swap(a, c);
+				// Calculate a score that is used to determine wich sets are most likely to be actual finder pattern sets,
+				// the smaller the better. Prefer finder patterns that are close to each with similar distances to each other.
+				// Note: experiments incorporating cosAB_BC or the difference of the finder pattern sizes did not yield better results.
+				auto score = distAB + distBC + std::abs(distAB - distBC);
 
 				// arbitrarily limit the number of potential sets
-				if (sets.size() < 16 || sets.crbegin()->first > d) {
-					sets.emplace(d, FinderPatternSet{*a, *b, *c});
-					if (sets.size() > 16)
+				// (this has performance implications while limiting the maximal number of detected symbols)
+				const size_t setSizeLimit = 256;
+				if (sets.size() < setSizeLimit || sets.crbegin()->first > score) {
+					// Use cross product to figure out whether A and C are correct or flipped.
+					// This asks whether BC x BA has a positive z component, which is the arrangement
+					// we want for A, B, C. If it's negative then swap A and C.
+					if (cross(*c - *b, *a - *b) < 0)
+						std::swap(a, c);
+
+					sets.emplace(score, FinderPatternSet{*a, *b, *c});
+					if (sets.size() > setSizeLimit)
 						sets.erase(std::prev(sets.end()));
+					stats.accepted++;
 				}
 			}
 		}
 	}
+
+	log_l("rejectSize=%d nearFPs=%d candidates=%d rejectLeg=%d rejectMod=%d rejectAng=%d accepted=%d",
+		  stats.rejSize, stats.nearFPs, stats.candidates, stats.rejLegRatio, stats.rejModCount, stats.rejAngle, stats.accepted);
 
 	// convert from multimap to vector
 	FinderPatternSets res;
 	res.reserve(sets.size());
 	for (auto& [d, s] : sets)
 		res.push_back(s);
+
+	log_l("FPSets: %d", Size(res));
+
 	return res;
 }
 
-static double EstimateModuleSize(const BitMatrix& image, PointF a, PointF b)
+static double EstimateModuleSize(const BitMatrix& image, ConcentricPattern a, ConcentricPattern b)
 {
 	BitMatrixCursorF cur(image, a, b - a);
-
-	cur.stepToEdge(3);
-
-	cur.turnBack();
-	cur.step();
 	assert(cur.isBlack());
 
-	auto pattern = cur.readPattern<std::array<int, 4>>();
+	auto pattern = ReadSymmetricPattern<5>(cur, a.size * 2);
+	if (!pattern || !IsPattern<true>(*pattern, PATTERN))
+		return -1;
 
-	return Reduce(pattern) / 6.0 * length(cur.d);
+	return (2 * Reduce(*pattern) - (*pattern)[0] - (*pattern)[4]) / 12.0 * length(cur.d);
 }
 
 struct DimensionEstimate
 {
 	int dim = 0;
 	double ms = 0;
-	int err = 0;
+	int err = 4;
 };
 
-static DimensionEstimate EstimateDimension(const BitMatrix& image, PointF a, PointF b)
+static DimensionEstimate EstimateDimension(const BitMatrix& image, ConcentricPattern a, ConcentricPattern b)
 {
 	auto ms_a = EstimateModuleSize(image, a, b);
 	auto ms_b = EstimateModuleSize(image, b, a);
+
+	if (ms_a < 0 || ms_b < 0)
+		return {};
+
 	auto moduleSize = (ms_a + ms_b) / 2;
 
-	int dimension = std::lround(distance(a, b) / moduleSize) + 7;
+	int dimension = narrow_cast<int>(std::lround(distance(a, b) / moduleSize) + 7);
 	int error     = 1 - (dimension % 4);
 
 	return {dimension + error, moduleSize, std::abs(error)};
@@ -210,26 +352,25 @@ static RegressionLine TraceLine(const BitMatrix& image, PointF p, PointF d, int 
 	RegressionLine line;
 	line.setDirectionInward(cur.back());
 
-	cur.stepToEdge(edge);
-	if (edge == 3) {
-		// collect points inside the black line -> go one step back
+	// collect points inside the black line -> backup on 3rd edge
+	cur.stepToEdge(edge, 0, edge == 3);
+	if (edge == 3)
 		cur.turnBack();
-		cur.step();
+
+	auto curI = BitMatrixCursorI(image, PointI(cur.p), PointI(mainDirection(cur.d)));
+	// make sure curI positioned such that the white->black edge is directly behind
+	// Test image: fix-traceline.jpg
+	while (curI.isIn() && !curI.edgeAtBack()) {
+		if (curI.edgeAtLeft())
+			curI.turnRight();
+		else if (curI.edgeAtRight())
+			curI.turnLeft();
+		else
+			curI.step(-1);
 	}
 
 	for (auto dir : {Direction::LEFT, Direction::RIGHT}) {
-		auto c = BitMatrixCursorI(image, PointI(cur.p), PointI(mainDirection(cur.direction(dir))));
-		// if cur.d is near diagonal, it could be c.p is at a corner, i.e. c is not currently at an edge and hence,
-		// stepAlongEdge() would fail. Going either a step forward or backward should do the trick.
-		if (!c.edgeAt(dir)) {
-			c.step();
-			if (!c.edgeAt(dir)) {
-				c.step(-2);
-				if (!c.edgeAt(dir))
-					return {};
-			}
-		}
-
+		auto c = BitMatrixCursorI(image, curI.p, curI.direction(dir));
 		auto stepCount = static_cast<int>(maxAbsComponent(cur.p - p));
 		do {
 			line.add(centered(c.p));
@@ -239,29 +380,100 @@ static RegressionLine TraceLine(const BitMatrix& image, PointF p, PointF d, int 
 	line.evaluate(1.0, true);
 
 	for (auto p : line.points())
-		log(p, 2);
+		log(p, LOG_G);
 
 	return line;
 }
 
-static DetectorResult SampleAtFinderPatternSet(const BitMatrix& image, const FinderPatternSet& fp)
+// estimate how tilted the symbol is (return value between 1 and 2, see also above)
+static double EstimateTilt(const FinderPatternSet& fp)
+{
+	int min = std::min({fp.bl.size, fp.tl.size, fp.tr.size});
+	int max = std::max({fp.bl.size, fp.tl.size, fp.tr.size});
+	return double(max) / min;
+}
+
+static PerspectiveTransform Mod2Pix(int dimension, PointF brOffset, QuadrilateralF pix)
+{
+	auto quad = Rectangle(dimension, dimension, 3.5);
+	quad[2] = quad[2] - brOffset;
+	return {quad, pix};
+}
+
+static std::optional<PointF> LocateAlignmentPattern(const BitMatrix& image, double moduleSize, PointF estimate)
+{
+	log(estimate, LOG_R);
+	log_l("LocateAlignmentPattern: local modSize = %.3f @ (%d, %d)", moduleSize, PointI(estimate).x * 5 + 2, PointI(estimate).y * 5 + 2);
+
+	for (auto d : {PointF{0, 0}, {0, -1}, {0, 1}, {-1, 0}, {1, 0}, {-1, -1}, {1, -1}, {1, 1}, {-1, 1},
+#if 1
+				   }) {
+#else
+				   {0, -2}, {0, 2}, {-2, 0}, {2, 0}, {-1, -2}, {1, -2}, {-1, 2}, {1, 2}, {-2, -1}, {-2, 1}, {2, -1}, {2, 1}}) {
+#endif
+		auto p = estimate + moduleSize * 2.8 * d;
+		if (!image.isIn(p))
+			continue;
+
+		auto cor = CenterOfRing(image, PointI(p), moduleSize * 3, 1, false);
+
+		// if we did not land on a black pixel the concentric pattern finder will fail
+		if (!cor || !image.get(*cor))
+			continue;
+
+		if (auto cor1 = CenterOfRing(image, PointI(*cor), moduleSize * 2, 1))
+			if (auto cor2 = CenterOfRing(image, PointI(*cor), moduleSize * 3, 2))
+				if (distance(*cor1, *cor2) < moduleSize / 2 && cor2->size > cor1->size) {
+					auto res = (*cor1 + *cor2) / 2;
+					log(res, LOG_I);
+					return res;
+				}
+	}
+
+	return {};
+}
+
+static const Version* ReadVersion(const BitMatrix& image, int dimension, const PerspectiveTransform& mod2Pix)
+{
+	int bits[2] = {};
+
+	for (bool mirror : {false, true}) {
+		// Read top-right/bottom-left version info: 3 wide by 6 tall (depending on mirrored)
+		int versionBits = 0;
+		for (int y = 5; y >= 0; --y)
+			for (int x = dimension - 9; x >= dimension - 11; --x) {
+				auto mod = mirror ? PointI{y, x} : PointI{x, y};
+				auto pix = mod2Pix(centered(mod));
+				if (!image.isIn(pix))
+					versionBits = -1;
+				else
+					AppendBit(versionBits, image.get(pix));
+				log(pix, LOG_B);
+			}
+		bits[static_cast<int>(mirror)] = versionBits;
+	}
+
+	return Version::DecodeVersionInformation(bits[0], bits[1]);
+}
+
+DetectorResults SampleQR(const BitMatrix& image, const FinderPatternSet& fp)
 {
 	auto top  = EstimateDimension(image, fp.tl, fp.tr);
 	auto left = EstimateDimension(image, fp.tl, fp.bl);
-	auto best = top.err < left.err ? top : left;
+
+	if (!top.dim && !left.dim)
+		co_return;
+
+	auto best = top.err == left.err ? (top.dim > left.dim ? top : left) : (top.err < left.err ? top : left);
 	int dimension = best.dim;
-	int moduleSize = static_cast<int>(best.ms + 1);
+	auto moduleSize = top.dim == left.dim ? std::midpoint(top.ms, left.ms) : best.ms;
 
-	auto quad = Rectangle(dimension, dimension, 3.5);
-
-	auto sample = [&](PointF br, PointF quad2) {
-		log(br, 3);
-		quad[2] = quad2;
-		return SampleGrid(image, dimension, dimension, {quad, {fp.tl, fp.tr, br, fp.bl}});
-	};
+	auto br = PointF{-1, -1};
+	auto brOffset = PointF{3, 3};
+	bool brFound = false;
 
 	// Everything except version 1 (21 modules) has an alignment pattern. Estimate the center of that by intersecting
-	// line extensions of the 1 module wide sqare around the finder patterns. This could also help with detecting
+	// line extensions of the 1 module wide square around the finder patterns. This could also help with detecting
 	// slanted symbols of version 1.
 
 	// generate 4 lines: outer and inner edge of the 1 module wide black line between the two outer and the inner
@@ -272,34 +484,150 @@ static DetectorResult SampleAtFinderPatternSet(const BitMatrix& image, const Fin
 	auto tr3 = TraceLine(image, fp.tr, fp.tl, 3);
 
 	if (bl2.isValid() && tr2.isValid() && bl3.isValid() && tr3.isValid()) {
+		// TODO: check the bl and tr pair is sufficiently parallel/perpendicular to be considered valid, deal with round fps
 		// intersect both outer and inner line pairs and take the center point between the two intersection points
-		auto brInter = (intersect(bl2, tr2) + intersect(bl3, tr3)) / 2;
-		log(brInter, 3);
+		auto brInter = (intersect(bl2, tr2) + intersect(bl3, tr3)) / 2; // brInter might be NAN or INF
+		log(brInter, LOG_B);
 
-		// if the estimated alignment pattern position is outside of the image, stop here
-		if (!image.isIn(PointI(brInter), 3 * moduleSize))
-			return {};
+		if (dimension > 21 && image.isIn(brInter))
+			if (auto brCP = LocateAlignmentPattern(image, moduleSize, brInter))
+				br = *brCP;
 
-		if (dimension > 21) {
-			// just in case we landed outside of the central black module of the alignment pattern, use the center
-			// of the next best circle (either outer or inner edge of the white part of the alignment pattern)
-			auto brCoR = CenterOfRing(image, PointI(brInter), moduleSize * 4, 1, false).value_or(brInter);
-			// if we did not land on a black pixel or the concentric pattern finder fails,
-			// leave the intersection of the lines as the best guess
-			if (image.get(brCoR)) {
-				if (auto brCP = LocateConcentricPattern<true>(image, FixedPattern<3, 3>{1, 1, 1}, brCoR, moduleSize * 3))
-					return sample(*brCP, quad[2] - PointF(3, 3));
-			}
-		}
-
-		// if the resolution of the RegressionLines is sufficient, use their intersection as the best estimate
-		// (see discussion in #199, TODO: tune threshold in RegressionLine::isHighRes())
-		if (bl2.isHighRes() && bl3.isHighRes() && tr2.isHighRes() && tr3.isHighRes())
-			return sample(brInter, quad[2] - PointF(3, 3));
+		brFound = image.isIn(br);
+		if (!brFound)
+			br = brInter;
 	}
 
-	// otherwise the simple estimation used by upstream is used as a best guess fallback
-	return sample(fp.tr - fp.tl + fp.bl, quad[2]);
+	// otherwise or if finder patterns are not square, the simple estimation used by upstream is used as a best guess fallback
+	if (!image.isIn(br) || !FitSquareToPoints(image, fp.bl, fp.bl.size, 2, false)) {
+		br = fp.tr - fp.tl + fp.bl;
+		brOffset = PointF(0, 0);
+	}
+
+	log(br, LOG_B);
+	auto mod2Pix = Mod2Pix(dimension, brOffset, {fp.tl, fp.tr, br, fp.bl});
+	if (!mod2Pix.isValid())
+		co_return;
+
+#if 1
+	// If the bottom-right alignment pattern was not found, try to find the corner of the symbol
+	if (!brFound) {
+		auto grid = LocalGrid(image, mod2Pix, {dimension, dimension}).at({dimension - 1, dimension - 1}, {-4, -4});
+		if (auto corner = grid.findCorner(6, {1, 1})){
+			br = grid.getPos(PointI{-4, -4});
+			brOffset = PointF(1, 1);
+			mod2Pix = Mod2Pix(dimension, brOffset, {fp.tl, fp.tr, br, fp.bl});
+		}
+	}
+#endif
+
+	if( dimension >= Version::SymbolSize(7, Type::Model2).x) {
+		auto version = ReadVersion(image, dimension, mod2Pix);
+
+		// if the version bits are garbage -> discard the detection
+		if (!version || std::min(std::abs(version->dimension() - top.dim), std::abs(version->dimension() - left.dim)) > 8)
+			co_return;
+		if (version->dimension() != dimension) {
+			log_l("update dimension: %d -> %d", dimension, version->dimension());
+			dimension = version->dimension();
+			mod2Pix = Mod2Pix(dimension, brOffset, {fp.tl, fp.tr, br, fp.bl});
+		}
+
+#if 1 // finding and evaluating the alignment patterns to enable a tiled sampling of the symbol
+
+		auto& apM = version->alignmentPatternCenters(); // alignment pattern positions in modules
+		auto apP = Matrix<std::optional<PointF>>(Size(apM), Size(apM)); // found/guessed alignment pattern positions in pixels
+		const int N = Size(apM) - 1;
+
+		// project the alignment pattern at module coordinates x/y to pixel coordinate based on current mod2Pix
+		auto projectM2P = [&mod2Pix, &apM](int x, int y) { return mod2Pix(centered(PointI(apM[x], apM[y]))); };
+		// estimate module size at module coordinates x/y based on current mod2Pix
+		auto estimateModuleSize = [&mod2Pix, &apM](int x, int y) {
+			auto p0 = mod2Pix(PointF(apM[x], apM[y]));
+			auto p1 = mod2Pix(PointF(apM[x] + 1, apM[y]));
+			auto p2 = mod2Pix(PointF(apM[x], apM[y] + 1));
+			return (distance(p0, p1) + distance(p0, p2)) / 2;
+		};
+
+		auto findInnerCornerOfConcentricPattern = [&image, &apP, &projectM2P](int x, int y, const ConcentricPattern& fp) {
+			auto pc = *apP.set(x, y, projectM2P(x, y));
+			if (auto fpQuad = FindConcentricPatternCorners(image, fp, fp.size, 2))
+				for (auto c : *fpQuad)
+					if (distance(c, pc) < fp.size / 2)
+						apP.set(x, y, c);
+		};
+
+		findInnerCornerOfConcentricPattern(0, 0, fp.tl);
+		findInnerCornerOfConcentricPattern(0, N, fp.bl);
+		findInnerCornerOfConcentricPattern(N, 0, fp.tr);
+
+		auto bestGuessAPP = [&](int x, int y){
+			if (auto p = apP(x, y))
+				return *p;
+			return projectM2P(x, y);
+		};
+
+		for (int y = 0; y <= N; ++y)
+			for (int x = 0; x <= N; ++x) {
+				if (apP(x, y))
+					continue;
+
+				PointF guessed =
+					x * y == 0 ? bestGuessAPP(x, y) : bestGuessAPP(x - 1, y) + bestGuessAPP(x, y - 1) - bestGuessAPP(x - 1, y - 1);
+				if (auto found = LocateAlignmentPattern(image, estimateModuleSize(x, y), guessed))
+					apP.set(x, y, found);
+			}
+
+		// go over the whole set of alignment patters again and try to fill any remaining gap by using available neighbors as guides
+		for (int y = 0; y <= N; ++y)
+			for (int x = 0; x <= N; ++x) {
+				if (apP(x, y))
+					continue;
+
+				// find the two closest valid alignment pattern pixel positions both horizontally and vertically
+				std::vector<PointF> hori, verti;
+				for (int i = 2; i < 2 * N + 2 && Size(hori) < 2; ++i) {
+					int xi = x + i / 2 * (i%2 ? 1 : -1);
+					if (0 <= xi && xi <= N && apP(xi, y))
+						hori.push_back(*apP(xi, y));
+				}
+				for (int i = 2; i < 2 * N + 2 && Size(verti) < 2; ++i) {
+					int yi = y + i / 2 * (i%2 ? 1 : -1);
+					if (0 <= yi && yi <= N && apP(x, yi))
+						verti.push_back(*apP(x, yi));
+				}
+
+				// if we found 2 distinct points each, intersect the two lines that are formed by connecting the point pairs
+				if (Size(hori) == 2 && Size(verti) == 2 && hori[0] != hori[1] && verti[0] != verti[1]) {
+					auto guessed = intersect(RegressionLine(hori[0], hori[1]), RegressionLine(verti[0], verti[1]));
+					auto found = LocateAlignmentPattern(image, estimateModuleSize(x, y), guessed);
+					// search again near that intersection and if the search fails, use the intersection
+					if (!found) log_l("location guessed at %dx%d", x, y);
+					apP.set(x, y, found ? *found : guessed);
+				}
+			}
+
+		if (auto c = apP.get(N, N))
+			mod2Pix = Mod2Pix(dimension, PointF(3, 3), {fp.tl, fp.tr, *c, fp.bl});
+
+		co_yield SampleGrid(image, dimension, dimension, mod2Pix, std::move(apP), apM, apM);
+#endif
+	}
+	else
+		co_yield SampleGrid(image, dimension, dimension, mod2Pix);
+
+	// if we have not found the br alignment pattern, we check
+	// a) if we have a version 1 symbol and tried and failed with the intersection of the trace lines (#1086), or
+	// b) if the symbol is almost level and the resolution of the RegressionLines is not sufficient (#199 and estimate-tilt.jpg)
+	// we then try the fallback method of sampling the symbol with the br corner extrapolated from the other three corners.
+	// TODO: re-evaluate the following logic after adding the corner finding fallback above
+	if (!brFound
+		&& ((dimension == 21 && brOffset != PointF(0, 0))
+			|| (EstimateTilt(fp) < 1.1 && !(bl2.isHighRes() && bl3.isHighRes() && tr2.isHighRes() && tr3.isHighRes()))))
+		{
+			mod2Pix = Mod2Pix(dimension, PointF(0, 0), {fp.tl, fp.tr, fp.tr - fp.tl + fp.bl, fp.bl});
+			co_yield SampleGrid(image, dimension, dimension, mod2Pix);
+		}
 }
 
 /**
@@ -308,7 +636,7 @@ static DetectorResult SampleAtFinderPatternSet(const BitMatrix& image, const Fin
 * around it. This is a specialized method that works exceptionally fast in this special
 * case.
 */
-static DetectorResult DetectPure(const BitMatrix& image)
+DetectorResult DetectPureQR(const BitMatrix& image)
 {
 	using Pattern = std::array<PatternView::value_type, PATTERN.size()>;
 
@@ -316,26 +644,64 @@ static DetectorResult DetectPure(const BitMatrix& image)
 	SaveAsPBM(image, "weg.pbm");
 #endif
 
+	constexpr int MIN_MODULES = Version::SymbolSize(1, Type::Model2).x;
+
 	int left, top, width, height;
 	if (!image.findBoundingBox(left, top, width, height, MIN_MODULES) || std::abs(width - height) > 1)
 		return {};
-	int right  = left + width - 1;
-	int bottom = top + height - 1;
+	auto pos = Rectangle<PointI>(left, top, width, height);
 
-	PointI tl{left, top}, tr{right, top}, bl{left, bottom};
+	const PointI &tl = pos.topLeft(), &tr = pos.topRight(), &bl = pos.bottomLeft();
 	Pattern diagonal;
-	// allow corners be moved one pixel inside to accomodate for possible aliasing artifacts
+	// allow corners be moved one pixel inside to accommodate for possible aliasing artifacts
 	for (auto [p, d] : {std::pair(tl, PointI{1, 1}), {tr, {-1, 1}}, {bl, {1, -1}}}) {
-		diagonal = BitMatrixCursorI(image, p, d).readPatternFromBlack<Pattern>(1, width / 3);
+		diagonal = BitMatrixCursorI(image, p, d).readPatternFromBlack<Pattern>(1, width / 3 + 1);
 		if (!IsPattern(diagonal, PATTERN))
 			return {};
 	}
 
-	auto fpWidth = Reduce(diagonal);
-	auto dimension = EstimateDimension(image, tl + fpWidth / 2 * PointF(1, 1), tr + fpWidth / 2 * PointF(-1, 1)).dim;
+	PointF::value_t fpWidth = Reduce(diagonal);
+	auto dimension =
+		EstimateDimension(image, {tl + fpWidth / 2 * PointF(1, 1), fpWidth}, {tr + fpWidth / 2 * PointF(-1, 1), fpWidth}).dim;
 
 	float moduleSize = float(width) / dimension;
-	if (dimension < MIN_MODULES || dimension > MAX_MODULES ||
+	if (!Version::IsValidSize({dimension, dimension}, Type::Model2) ||
+		!image.isIn(PointF{left + moduleSize / 2 + (dimension - 1) * moduleSize,
+						   top + moduleSize / 2 + (dimension - 1) * moduleSize}))
+		return {};
+
+#ifdef PRINT_DEBUG
+	LogMatrix log;
+	LogMatrixWriter lmw(log, image, 5, "grid2.pnm");
+	for (int y = 0; y < dimension; y++)
+		for (int x = 0; x < dimension; x++)
+			log(PointF(left + (x + .5f) * moduleSize, top + (y + .5f) * moduleSize));
+#endif
+
+	// Now just read off the bits (this is a crop + subsample)
+	return {Deflate(image, dimension, dimension, top + moduleSize / 2, left + moduleSize / 2, moduleSize), std::move(pos)};
+}
+
+DetectorResult DetectPureMQR(const BitMatrix& image)
+{
+	using Pattern = std::array<PatternView::value_type, PATTERN.size()>;
+
+	constexpr int MIN_MODULES = Version::SymbolSize(1, Type::Micro).x;
+
+	int left, top, width, height;
+	if (!image.findBoundingBox(left, top, width, height, MIN_MODULES) || std::abs(width - height) > 1)
+		return {};
+
+	// allow corners be moved one pixel inside to accommodate for possible aliasing artifacts
+	auto diagonal = BitMatrixCursorI(image, {left, top}, {1, 1}).readPatternFromBlack<Pattern>(1);
+	if (!IsPattern(diagonal, PATTERN))
+		return {};
+
+	auto fpWidth = Reduce(diagonal);
+	float moduleSize = float(fpWidth) / 7;
+	int dimension = narrow_cast<int>(std::lround(width / moduleSize));
+
+	if (!Version::IsValidSize({dimension, dimension}, Type::Micro) ||
 		!image.isIn(PointF{left + moduleSize / 2 + (dimension - 1) * moduleSize,
 						   top + moduleSize / 2 + (dimension - 1) * moduleSize}))
 		return {};
@@ -350,28 +716,273 @@ static DetectorResult DetectPure(const BitMatrix& image)
 
 	// Now just read off the bits (this is a crop + subsample)
 	return {Deflate(image, dimension, dimension, top + moduleSize / 2, left + moduleSize / 2, moduleSize),
-			{{left, top}, {right, top}, {right, bottom}, {left, bottom}}};
+			Rectangle<PointI>(left, top, width, height)};
 }
 
-DetectorResult Detect(const BitMatrix& image, bool tryHarder, bool isPure)
+DetectorResult DetectPureRMQR(const BitMatrix& image)
 {
+	constexpr auto SUBPATTERN = FixedPattern<4, 4>{1, 1, 1, 1};
+	constexpr auto TIMINGPATTERN = FixedPattern<10, 10>{1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+
+	using Pattern = std::array<PatternView::value_type, PATTERN.size()>;
+	using SubPattern = std::array<PatternView::value_type, SUBPATTERN.size()>;
+	using TimingPattern = std::array<PatternView::value_type, TIMINGPATTERN.size()>;
+
 #ifdef PRINT_DEBUG
-	LogMatrixWriter lmw(log, image, 5, "qr-log.pnm");
+	SaveAsPBM(image, "weg.pbm");
 #endif
 
-	if (isPure)
-		return DetectPure(image);
+	constexpr int MIN_MODULES = Version::SymbolSize(1, Type::rMQR).y;
 
-	auto sets = GenerateFinderPatternSets(FindFinderPatterns(image, tryHarder));
+	int left, top, width, height;
+	if (!image.findBoundingBox(left, top, width, height, MIN_MODULES) || height >= width)
+		return {};
+	auto pos = Rectangle<PointI>(left, top, width, height);
 
-	if (sets.empty())
+	const PointI &tl = pos.topLeft(), &tr = pos.topRight(), &bl = pos.bottomLeft(), &br = pos.bottomRight();
+
+	// allow corners be moved one pixel inside to accommodate for possible aliasing artifacts
+	auto diagonal = BitMatrixCursorI(image, tl, {1, 1}).readPatternFromBlack<Pattern>(1);
+	if (!IsPattern(diagonal, PATTERN))
+		return {};
+
+	// Finder sub pattern
+	auto subdiagonal = BitMatrixCursorI(image, br, {-1, -1}).readPatternFromBlack<SubPattern>(1);
+	if (!IsPattern(subdiagonal, SUBPATTERN))
+		return {};
+
+	float moduleSize = Reduce(diagonal) + Reduce(subdiagonal);
+
+	// Horizontal timing patterns
+	for (auto [p, d] : {std::pair(tr, PointI{-1, 0}), {bl, {1, 0}}, {tl, {1, 0}}, {br, {-1, 0}}}) {
+		auto cur = BitMatrixCursorI(image, p, d);
+		// skip corner / finder / sub pattern edge
+		cur.stepToEdge(2 + cur.isWhite());
+		auto timing = cur.readPattern<TimingPattern>();
+		if (!IsPattern(timing, TIMINGPATTERN))
+			return {};
+		moduleSize += Reduce(timing);
+	}
+
+	moduleSize /= 7 + 4 + 4 * 10; // fp + sub + 4 x timing
+	int dimW = narrow_cast<int>(std::lround(width / moduleSize));
+	int dimH = narrow_cast<int>(std::lround(height / moduleSize));
+
+	if (!Version::IsValidSize(PointI{dimW, dimH}, Type::rMQR))
 		return {};
 
 #ifdef PRINT_DEBUG
-	printf("size of sets: %d\n", Size(sets));
+	LogMatrix log;
+	LogMatrixWriter lmw(log, image, 5, "grid2.pnm");
+	for (int y = 0; y < dimH; y++)
+		for (int x = 0; x < dimW; x++)
+			log(pos.topLeft() + moduleSize * PointF(x + .5f, y + .5f));
 #endif
 
-	return SampleAtFinderPatternSet(image, sets[0]);
+	// Now just read off the bits (this is a crop + subsample)
+	return {Deflate(image, dimW, dimH, top + moduleSize / 2, left + moduleSize / 2, moduleSize), std::move(pos)};
+}
+
+DetectorResult SampleMQR(const BitMatrix& image, const ConcentricPattern& fp)
+{
+	auto fpQuad = FindConcentricPatternCorners(image, fp, fp.size, 2);
+	if (!fpQuad)
+		return {};
+
+	auto srcQuad = Rectangle(7, 7, 0.5);
+
+#if defined(_MSVC_LANG) && !(_MSC_VER >= 1940) // VS2022 17.10 and later work
+	// see MSVC issue https://developercommunity.visualstudio.com/t/constexpr-object-is-unable-to-be-used-as/10035065
+	static
+#else
+	constexpr
+#endif
+		const PointI FORMAT_INFO_COORDS[] = {{0, 8}, {1, 8}, {2, 8}, {3, 8}, {4, 8}, {5, 8}, {6, 8}, {7, 8}, {8, 8},
+											 {8, 7}, {8, 6}, {8, 5}, {8, 4}, {8, 3}, {8, 2}, {8, 1}, {8, 0}};
+
+	FormatInformation bestFI;
+	PerspectiveTransform bestPT;
+	BitMatrixCursorF cur(image, {}, {});
+
+	for (int i = 0; i < 4; ++i) {
+		auto mod2Pix = PerspectiveTransform(srcQuad, RotatedCorners(*fpQuad, i));
+
+		auto check = [&](int i, bool checkOne) {
+			auto p = mod2Pix(centered(FORMAT_INFO_COORDS[i]));
+			return image.isIn(p) && (!checkOne || image.get(p));
+		};
+
+		// check that we see both innermost timing pattern modules
+		if (!check(0, true) || !check(8, false) || !check(16, true))
+			continue;
+
+		int formatInfoBits = 0;
+		for (int i = 1; i <= 15; ++i)
+			AppendBit(formatInfoBits, cur.blackAt(mod2Pix(centered(FORMAT_INFO_COORDS[i]))));
+
+		auto fi = FormatInformation::DecodeMQR(formatInfoBits);
+		if (fi.hammingDistance < bestFI.hammingDistance) {
+			bestFI = fi;
+			bestPT = mod2Pix;
+		}
+	}
+
+	if (!bestFI.isValid())
+		return {};
+
+	const int dim = Version::SymbolSize(bestFI.microVersion, Type::Micro).x;
+
+	// check that we are in fact not looking at a corner of a non-micro QRCode symbol
+	// we accept at most 1/3rd black pixels in the quite zone (in a QRCode symbol we expect about 1/2).
+	int blackPixels = 0;
+	for (int i = 0; i < dim; ++i) {
+		auto px = bestPT(centered(PointI{i, dim}));
+		auto py = bestPT(centered(PointI{dim, i}));
+		blackPixels += cur.blackAt(px) + cur.blackAt(py);
+	}
+	if (blackPixels > 2 * dim / 3)
+		return {};
+
+	auto grid = LocalGrid(image, bestPT, {dim, dim});
+
+	using enum LocalGrid::Pattern;
+	auto tr = grid.at({dim - 1, 0}, {-2, 1}).find({{"l", BW}, {"ld", W, {1, -1}}}, 4);
+	auto bl = grid.at({0, dim - 1}, {1, -2}).find({{"u", BW}, {"ur", W, {-1, 1}}}, 4);
+	auto br = grid.at({dim - 1, dim - 1}, {-3, -3}).findCorner(5, {1, 1});
+
+	bestPT = PerspectiveTransform(Rectangle(dim, dim, 0.5),
+								  {bestPT({0.5, 0.5}), tr.value_or(bestPT({dim - 0.5, 0.5})),
+								   br.value_or(bestPT({dim - 0.5, dim - 0.5})), bl.value_or(bestPT({0.5, dim - 0.5}))});
+
+	return SampleGrid(image, dim, dim, bestPT);
+}
+
+DetectorResult SampleRMQR(const BitMatrix& image, const ConcentricPattern& fp)
+{
+	auto fpQuad = FindConcentricPatternCorners(image, fp, fp.size, 2);
+	if (!fpQuad)
+		return {};
+
+	auto srcQuad = Rectangle(7, 7, 0.5);
+
+	static const PointI FORMAT_INFO_EDGE_COORDS[] = {{8, 0}, {9, 0}, {10, 0}, {11, 0}};
+	static const PointI FORMAT_INFO_COORDS[] = {
+		{11, 3}, {11, 2}, {11, 1},
+		{10, 5}, {10, 4}, {10, 3}, {10, 2}, {10, 1},
+		{ 9, 5}, { 9, 4}, { 9, 3}, { 9, 2}, { 9, 1},
+		{ 8, 5}, { 8, 4}, { 8, 3}, { 8, 2}, { 8, 1},
+	};
+
+	FormatInformation bestFI;
+	PerspectiveTransform bestPT;
+	BitMatrixCursorF cur(image, {}, {});
+
+	for (int i = 0; i < 4; ++i) {
+		auto mod2Pix = PerspectiveTransform(srcQuad, RotatedCorners(*fpQuad, i));
+
+		auto check = [&](int i, bool on) {
+			return cur.testAt(mod2Pix(centered(FORMAT_INFO_EDGE_COORDS[i]))) == BitMatrixCursorF::Value(on);
+		};
+
+		// check that we see top edge timing pattern modules
+		if (!check(0, true) || !check(1, false) || !check(2, true) || !check(3, false))
+			continue;
+
+		uint32_t formatInfoBits = 0;
+		for (auto c : FORMAT_INFO_COORDS)
+			AppendBit(formatInfoBits, cur.blackAt(mod2Pix(centered(c))));
+
+		auto fi = FormatInformation::DecodeRMQR(formatInfoBits, 0 /*formatInfoBits2*/);
+		if (fi.hammingDistance < bestFI.hammingDistance) {
+			bestFI = fi;
+			bestPT = mod2Pix;
+		}
+	}
+
+	if (!bestFI.isValid())
+		return {};
+
+	const PointI dim = Version::SymbolSize(bestFI.microVersion, Type::rMQR);
+	const Version* version = Version::rMQR(bestFI.microVersion);
+	if (!version)
+		return {};
+
+	auto mod2Pix = bestPT;
+	auto grid = LocalGrid(image, mod2Pix, dim);
+	auto apM = version->alignmentPatternCenters();
+	apM.insert(apM.begin(), 0);       // include the top-left corner module in the alignment pattern centers
+	apM.insert(apM.end(), dim.x - 1); // include the top-right corner module in the alignment pattern centers
+	auto apP = Matrix<std::optional<PointF>>(Size(apM), 2); // found/guessed alignment pattern positions in pixels
+	const int R = 5;
+	using enum LocalGrid::Pattern;
+
+	apP.set(0, 0, mod2Pix(centered(PointI{0, 0})));         // tl fp corner
+	apP.set(0, 1, mod2Pix(centered(PointI{0, dim.y - 1}))); // bl fp corner
+	if (dim.y > 9)
+		apP.set(0, 1,
+				grid.at({0, dim.y - 1}, {1, -1})
+					.find({ // bl corner finder pattern
+						{"ru", B, {}, 2},
+						{"ru", W, {-1, 1}, R},
+						{"ld", WB, {1, -1}, 1},
+					}));
+
+	for (int i = 1; i < Size(apM) - 1; ++i) {
+		auto tr = grid.at({apM[i], 0}, {0, 2})
+					  .find({
+						  {"lr", WB, {}, R, 1},
+						  {"d", BW, {}, R - 1},
+						  //   {"lr", W, {0, -1}, R}, // quiet zone
+						  {"d", B, {-1, 0}, 2},
+						  {"d", B, {+1, 0}, 2},
+					  });
+		auto br = grid.at({apM[i], dim.y - 1}, {0, -2})
+					  .find({
+						  {"lr", WB, {}, R, 1},
+						  {"u", BW, {}, R - 1},
+						  //   {"lr", W, {0, +1}, R}, // quiet zone
+						  {"u", B, {-1, 0}, 2},
+						  {"u", B, {+1, 0}, 2},
+					  });
+		apP.set(i, 0, tr);
+		apP.set(i, 1, br);
+		if (tr && br)
+			mod2Pix = PerspectiveTransform(Rectangle(apM[i] + 1, dim.y, 0.5), {*apP(0, 0), *tr, *br, *apP(0, 1)});
+	}
+
+	// estimate module size at module coordinates x/y based on current mod2Pix
+	auto estimateModuleSize = [&mod2Pix, &dim]() {
+		auto p0 = mod2Pix(centered(dim - PointF(3, 3)));
+		auto p1 = mod2Pix(centered(dim - PointF(2, 3)));
+		auto p2 = mod2Pix(centered(dim - PointF(3, 2)));
+		return std::min(distance(p0, p1), distance(p0, p2));
+	}();
+
+	std::optional<PointF> tr, br;
+
+	if (auto ap = LocateAlignmentPattern(image, estimateModuleSize, mod2Pix(centered(dim - PointF(3, 3))))) {
+		// estimate tr based on current mod2pix and deviation of ap from its expected position
+		auto delta = *ap - mod2Pix(centered(dim - PointF(3, 3)));
+		tr = mod2Pix(centered(PointI{dim.x - 1, 0})) + delta;
+		auto rect = Rectangle(dim.x, dim.y, 0.5);
+		rect[2] = rect[2] - PointF(2, 2);
+		mod2Pix = PerspectiveTransform(rect, {*apP(0, 0), *tr, *ap, *apP(0, 1)});
+		tr = grid.at({dim.x - 1, 0}, {-3, 3})
+					.find({
+						{"ld", B, {0, 0}, 2},
+						{"ld", W, {+1, -1}, R},
+						{"ru", WB, {-1, +1}, 1},
+					})
+					.value_or(*tr);
+		br = mod2Pix(centered(PointI{dim.x - 1, dim.y - 1}));
+	}
+
+	apP.set(apM.size() - 1, 0, tr);
+	apP.set(apM.size() - 1, 1, br);
+	if (tr && br)
+		mod2Pix = PerspectiveTransform(Rectangle(dim.x, dim.y, 0.5), {*apP(0, 0), *tr, *br, *apP(0, 1)});
+
+	return SampleGrid(image, dim.x, dim.y, mod2Pix, std::move(apP), apM, std::vector{0, dim.y - 1});
 }
 
 } // namespace ZXing::QRCode

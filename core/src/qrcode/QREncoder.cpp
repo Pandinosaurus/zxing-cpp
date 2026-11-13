@@ -1,32 +1,21 @@
 /*
 * Copyright 2016 Huy Cuong Nguyen
 * Copyright 2016 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "QREncoder.h"
 
 #include "BitArray.h"
-#include "CharacterSetECI.h"
-#include "GenericGF.h"
+#include "ECI.h"
 #include "QREncodeResult.h"
 #include "QRErrorCorrectionLevel.h"
 #include "QRMaskUtil.h"
 #include "QRMatrixUtil.h"
-#include "ReedSolomonEncoder.h"
+#include "ReedSolomon.h"
 #include "TextEncoder.h"
 #include "ZXTestSupport.h"
+#include "ZXAlgorithms.h"
 
 #include <algorithm>
 #include <array>
@@ -38,7 +27,7 @@ namespace ZXing::QRCode {
 static const CharacterSet DEFAULT_BYTE_MODE_ENCODING = CharacterSet::ISO8859_1;
 
 // The original table is defined in the table 5 of JISX0510:2004 (p.19).
-static const std::array<int, 16*6> ALPHANUMERIC_TABLE = {
+static const std::array<int, 16 * 6> ALPHANUMERIC_TABLE = {
 	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  // 0x00-0x0f
 	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  // 0x10-0x1f
 	36, -1, -1, -1, 37, 38, -1, -1, -1, -1, 39, 40, -1, 41, 42, 43,  // 0x20-0x2f
@@ -90,7 +79,7 @@ CodecMode ChooseMode(const std::wstring& content, CharacterSet encoding)
 	bool hasNumeric = false;
 	bool hasAlphanumeric = false;
 	for (wchar_t c : content) {
-		if (c >= '0' && c <= '9') {
+		if (IsDigit(c)) {
 			hasNumeric = true;
 		}
 		else if (GetAlphanumericCode(c) != -1) {
@@ -114,7 +103,7 @@ CodecMode ChooseMode(const std::wstring& content, CharacterSet encoding)
 */
 static void AppendECI(CharacterSet eci, BitArray& bits)
 {
-	int eciValue = CharacterSetECI::ValueForCharset(eci);
+	int eciValue = ToInt(ToECI(eci));
 	if (eciValue >= 0 && eciValue <= 999999) {
 		bits.appendBits(static_cast<int>(CodecMode::ECI), 4);
 		if (eciValue <= 127) {
@@ -147,7 +136,7 @@ void AppendLengthInfo(int numLetters, const Version& version, CodecMode mode, Bi
 {
 	int numBits = CharacterCountBits(mode, version);
 	if (numLetters >= (1 << numBits)) {
-		return throw std::invalid_argument(std::to_string(numLetters) + " is bigger than " + std::to_string((1 << numBits) - 1));
+		throw std::invalid_argument(std::to_string(numLetters) + " is bigger than " + std::to_string((1 << numBits) - 1));
 	}
 	bits.appendBits(numLetters, numBits);
 }
@@ -250,20 +239,11 @@ ZXING_EXPORT_TEST_ONLY
 void AppendBytes(const std::wstring& content, CodecMode mode, CharacterSet encoding, BitArray& bits)
 {
 	switch (mode) {
-		case CodecMode::NUMERIC:
-			AppendNumericBytes(content, bits);
-			break;
-		case CodecMode::ALPHANUMERIC:
-			AppendAlphanumericBytes(content, bits);
-			break;
-		case CodecMode::BYTE:
-			Append8BitBytes(content, encoding, bits);
-			break;
-		case CodecMode::KANJI:
-			AppendKanjiBytes(content, bits);
-			break;
-		default:
-			throw std::invalid_argument("Invalid mode: " + std::to_string(static_cast<int>(mode)));
+	case CodecMode::NUMERIC:      AppendNumericBytes(content, bits); break;
+	case CodecMode::ALPHANUMERIC: AppendAlphanumericBytes(content, bits); break;
+	case CodecMode::BYTE:         Append8BitBytes(content, encoding, bits); break;
+	case CodecMode::KANJI:        AppendKanjiBytes(content, bits); break;
+	default: throw std::invalid_argument("Invalid mode: " + std::to_string(static_cast<int>(mode)));
 	}
 }
 
@@ -276,7 +256,7 @@ static bool WillFit(int numInputBits, const Version& version, ErrorCorrectionLev
 	// numBytes = 196
 	int numBytes = version.totalCodewords();
 	// getNumECBytes = 130
-	auto ecBlocks = version.ecBlocksForLevel(ecLevel);
+	auto& ecBlocks = version.ecBlocksForLevel(ecLevel);
 	int numEcBytes = ecBlocks.totalCodewords();
 	// getNumDataBytes = 196 - 130 = 66
 	int numDataBytes = numBytes - numEcBytes;
@@ -287,7 +267,7 @@ static bool WillFit(int numInputBits, const Version& version, ErrorCorrectionLev
 static const Version& ChooseVersion(int numInputBits, ErrorCorrectionLevel ecLevel)
 {
 	for (int versionNum = 1; versionNum <= 40; versionNum++) {
-		const Version* version = Version::VersionForNumber(versionNum);
+		const Version* version = Version::Model2(versionNum);
 		if (WillFit(numInputBits, *version, ecLevel)) {
 			return *version;
 		}
@@ -303,7 +283,8 @@ void TerminateBits(int numDataBytes, BitArray& bits)
 {
 	int capacity = numDataBytes * 8;
 	if (bits.size() > capacity) {
-		throw std::invalid_argument("data bits cannot fit in the QR Code" + std::to_string(bits.size()) + " > " + std::to_string(capacity));
+		throw std::invalid_argument("data bits cannot fit in the QR Code" + std::to_string(bits.size()) + " > "
+									+ std::to_string(capacity));
 	}
 	for (int i = 0; i < 4 && bits.size() < capacity; ++i) {
 		bits.appendBit(false);
@@ -339,7 +320,8 @@ struct BlockPair
 * JISX0510:2004 (p.30)
 */
 ZXING_EXPORT_TEST_ONLY
-void GetNumDataBytesAndNumECBytesForBlockID(int numTotalBytes, int numDataBytes, int numRSBlocks, int blockID,  int& numDataBytesInBlock, int& numECBytesInBlock)
+void GetNumDataBytesAndNumECBytesForBlockID(int numTotalBytes, int numDataBytes, int numRSBlocks, int blockID,
+											int& numDataBytesInBlock, int& numECBytesInBlock)
 {
 	if (blockID >= numRSBlocks) {
 		throw std::invalid_argument("Block ID too large");
@@ -370,11 +352,9 @@ void GetNumDataBytesAndNumECBytesForBlockID(int numTotalBytes, int numDataBytes,
 		throw std::invalid_argument("RS blocks mismatch");
 	}
 	// 196 = (13 + 26) * 4 + (14 + 26) * 1
-	if (numTotalBytes !=
-		((numDataBytesInGroup1 + numEcBytesInGroup1) *
-			numRsBlocksInGroup1) +
-			((numDataBytesInGroup2 + numEcBytesInGroup2) *
-				numRsBlocksInGroup2)) {
+	if (numTotalBytes
+		!= ((numDataBytesInGroup1 + numEcBytesInGroup1) * numRsBlocksInGroup1)
+			   + ((numDataBytesInGroup2 + numEcBytesInGroup2) * numRsBlocksInGroup2)) {
 		throw std::invalid_argument("Total bytes mismatch");
 	}
 
@@ -391,13 +371,8 @@ void GetNumDataBytesAndNumECBytesForBlockID(int numTotalBytes, int numDataBytes,
 ZXING_EXPORT_TEST_ONLY
 void GenerateECBytes(const ByteArray& dataBytes, int numEcBytes, ByteArray& ecBytes)
 {
-	std::vector<int> message(dataBytes.size() + numEcBytes, 0);
-	std::copy(dataBytes.begin(), dataBytes.end(), message.begin());
-	ReedSolomonEncode(GenericGF::QRCodeField256(), message, numEcBytes);
-
 	ecBytes.resize(numEcBytes);
-	std::transform(message.end() - numEcBytes, message.end(), ecBytes.begin(),
-				   [](auto c) { return static_cast<uint8_t>(c); });
+	ReedSolomonEncode(RSField::QRCode, dataBytes, ecBytes);
 }
 
 
@@ -456,7 +431,8 @@ BitArray InterleaveWithECBytes(const BitArray& bits, int numTotalBytes, int numD
 		}
 	}
 	if (numTotalBytes != output.sizeInBytes()) {  // Should be same.
-		throw std::invalid_argument("Interleaving error: " + std::to_string(numTotalBytes) + " and " + std::to_string(output.sizeInBytes()) + " differ.");
+		throw std::invalid_argument("Interleaving error: " + std::to_string(numTotalBytes) + " and " + std::to_string(output.sizeInBytes())
+									+ " differ.");
 	}
 	return output;
 }
@@ -492,7 +468,7 @@ static const Version& RecommendVersion(ErrorCorrectionLevel ecLevel, CodecMode m
 	// Hard part: need to know version to know how many bits length takes. But need to know how many
 	// bits it takes to know version. First we take a guess at version by assuming version will be
 	// the minimum, 1:
-	int provisionalBitsNeeded = CalculateBitsNeeded(mode, headerBits, dataBits, *Version::VersionForNumber(1));
+	int provisionalBitsNeeded = CalculateBitsNeeded(mode, headerBits, dataBits, *Version::Model2(1));
 	const Version& provisionalVersion = ChooseVersion(provisionalBitsNeeded, ecLevel);
 
 	// Use that guess to calculate the right version. I am still not sure this works in 100% of cases.
@@ -503,10 +479,11 @@ static const Version& RecommendVersion(ErrorCorrectionLevel ecLevel, CodecMode m
 EncodeResult Encode(const std::wstring& content, ErrorCorrectionLevel ecLevel, CharacterSet charset, int versionNumber,
 					bool useGs1Format, int maskPattern)
 {
-	bool charsetWasUnknown = charset == CharacterSet::Unknown;
-	if (charsetWasUnknown) {
+	if (charset == CharacterSet::Unknown) {
 		charset = DEFAULT_BYTE_MODE_ENCODING;
 	}
+
+	bool charsetIsDefault = (charset == DEFAULT_BYTE_MODE_ENCODING);
 
 	// Pick an encoding mode appropriate for the content. Note that this will not attempt to use
 	// multiple modes / segments even if that were more efficient. Twould be nice.
@@ -517,7 +494,7 @@ EncodeResult Encode(const std::wstring& content, ErrorCorrectionLevel ecLevel, C
 	BitArray headerBits;
 
 	// Append ECI segment if applicable
-	if (mode == CodecMode::BYTE && !charsetWasUnknown) {
+	if (mode == CodecMode::BYTE && !charsetIsDefault) {
 		AppendECI(charset, headerBits);
 	}
 
@@ -537,7 +514,7 @@ EncodeResult Encode(const std::wstring& content, ErrorCorrectionLevel ecLevel, C
 
 	const Version* version;
 	if (versionNumber > 0) {
-		version = Version::VersionForNumber(versionNumber);
+		version = Version::Model2(versionNumber);
 		if (version != nullptr) {
 			int bitsNeeded = CalculateBitsNeeded(mode, headerBits, dataBits, *version);
 			if (!WillFit(bitsNeeded, *version, ecLevel)) {
@@ -576,7 +553,7 @@ EncodeResult Encode(const std::wstring& content, ErrorCorrectionLevel ecLevel, C
 	output.version = version;
 
 	//  Choose the mask pattern and set to "qrCode".
-	int dimension = version->dimensionForVersion();
+	int dimension = version->dimension();
 	TritMatrix matrix(dimension, dimension);
 	output.maskPattern = maskPattern != -1 ? maskPattern : ChooseMaskPattern(finalBits, ecLevel, *version, matrix);
 

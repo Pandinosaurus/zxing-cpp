@@ -1,59 +1,85 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.21)
 project(ZXingPython)
 
-# get pybind11
-include(FetchContent)
-#set(FETCHCONTENT_QUIET Off)
-FetchContent_Declare (pybind11
-    GIT_REPOSITORY https://github.com/pybind/pybind11.git
-    GIT_TAG v2.6.2)
-FetchContent_MakeAvailable (pybind11)
+if (PROJECT_IS_TOP_LEVEL)
+    # TODO: replace with symlinks once https://github.com/scikit-build/scikit-build-core/issues/801 is resolved
+    message(STATUS "Copying files from parent folder needed for sdist")
+    foreach(NAME zxing.cmake LICENSE)
+        file(COPY_FILE
+                "${CMAKE_CURRENT_SOURCE_DIR}/../../${NAME}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/${NAME}"
+                ONLY_IF_DIFFERENT
+            )
+    endforeach()
 
-# check if we are called from the top-level ZXing project
-get_directory_property(hasParent PARENT_DIRECTORY)
-if (NOT hasParent)
-    # Force to build by C++17. The zxing-cpp require C++17 to build
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_STANDARD 20) # required here for the module itself
 
     option (BUILD_SHARED_LIBS "Link python module to shared lib" OFF)
-    option (BUILD_WRITERS "Build with writer support (encoders)" ON)
-    option (BUILD_READERS "Build with reader support (decoders)" ON)
+    option (ZXING_READERS "Build with reader support (decoders)" ON)
+    set    (ZXING_WRITERS "NEW" CACHE STRING "Build with old and/or new writer (encoder) backend (OFF/ON/OLD/NEW)")
+    set    (ZXING_DEPENDENCIES "AUTO" CACHE STRING "Fetch from github or use locally installed (AUTO/GITHUB/LOCAL)")
 
-    # build the main library
-    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../../core)
-        # In development mode, when the whole zxing-cpp directory is checked out, build against head code.
-        add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../core ZXing EXCLUDE_FROM_ALL)
+    # resolve the symlink so GCC doesn't randomly prefix paths with /core or /wrappers/python/core
+    file(REAL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/core" CORE_PATH)
+
+    if(EXISTS ${CORE_PATH})
+        add_subdirectory(${CORE_PATH} ZXing EXCLUDE_FROM_ALL)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/zxing.cmake)
     else()
-        # Building from python source distribution (which does not include the whole repository but only python part)
-        # so we need to get c++ source git to build the python extension. The python distribution version (given in
-        # VERSION_INFO), matches the c++ version the distribution must build against ; hence the checkout of
-        # related tag.
-        find_package (Git REQUIRED)
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} ls-remote https://github.com/nu-book/zxing-cpp.git tags/*
-            RESULT_VARIABLE RESULT
-            OUTPUT_VARIABLE OUTPUT)
-        string (FIND "${OUTPUT}" "refs/tags/v${VERSION_INFO}\n" FOUND_IDX)
-        if (FOUND_IDX LESS 0)
-            # Version not found in tags (suppose we are preparing future version), use master branch
-            FetchContent_Declare(zxing-cpp
-                GIT_REPOSITORY https://github.com/nu-book/zxing-cpp.git)
-        else()
-            FetchContent_Declare(zxing-cpp
-                GIT_REPOSITORY https://github.com/nu-book/zxing-cpp.git
-                GIT_TAG v${VERSION_INFO})
-        endif()
-        if(NOT zxing-cpp_POPULATED)
-            FetchContent_Populate(zxing-cpp)
-            add_subdirectory(${zxing-cpp_SOURCE_DIR}/core ZXing EXCLUDE_FROM_ALL)
-        endif()
+        message(FATAL_ERROR "Unable to locate zxing source code")
     endif()
 endif()
 
-# build the python module
-pybind11_add_module(zxingcpp zxing.cpp)
+# Try to import all Python components potentially needed by nanobind
+find_package(Python 3.10
+    REQUIRED COMPONENTS Interpreter Development.Module
+    OPTIONAL_COMPONENTS Development.SABIModule)
+zxing_add_package(nanobind nanobind https://github.com/wjakob/nanobind.git v3.1.0)
+
+nanobind_add_module(zxingcpp STABLE_ABI FREE_THREADED zxing.cpp)
 target_link_libraries(zxingcpp PRIVATE ZXing::ZXing)
 
-add_test(NAME PythonTest COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/test.py -v)
-set_property(TEST PythonTest PROPERTY ENVIRONMENT PYTHONPATH=$<TARGET_FILE_DIR:zxingcpp>)
+# Copy ZXing.dll alongside zxingcpp.pyd to solve ImportError during stub generation
+if (WIN32 AND BUILD_SHARED_LIBS)
+    add_custom_command(TARGET zxingcpp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:ZXing::ZXing>
+                $<TARGET_FILE_DIR:zxingcpp>
+        VERBATIM
+    )
+endif()
+
+nanobind_add_stub(
+    zxingcpp_stub
+    MODULE zxingcpp
+    OUTPUT zxingcpp.pyi
+    PYTHON_PATH $<TARGET_FILE_DIR:zxingcpp>
+    DEPENDS zxingcpp
+)
+
+if (ZXING_READERS AND ZXING_WRITERS)
+    add_test(NAME PythonTest COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test.py -v)
+    set_property(TEST PythonTest PROPERTY ENVIRONMENT PYTHONPATH=$<TARGET_FILE_DIR:zxingcpp>)
+endif()
+
+# Default package install directory ("zxingcpp"), enables 'import zxingcpp'
+if (NOT DEFINED ZXING_PYTHON_INSTALL_LIBDIR)
+    set(ZXING_PYTHON_INSTALL_LIBDIR "zxingcpp")
+endif()
+
+# Create py.typed marker file for type checking
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/py.typed" "")
+
+install(TARGETS zxingcpp
+    COMPONENT python
+    LIBRARY DESTINATION "${ZXING_PYTHON_INSTALL_LIBDIR}")
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/init.py
+    COMPONENT python
+    RENAME __init__.py
+    DESTINATION "${ZXING_PYTHON_INSTALL_LIBDIR}")
+install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/zxingcpp.pyi
+        ${CMAKE_CURRENT_BINARY_DIR}/py.typed
+    COMPONENT python
+    DESTINATION "${ZXING_PYTHON_INSTALL_LIBDIR}")
+

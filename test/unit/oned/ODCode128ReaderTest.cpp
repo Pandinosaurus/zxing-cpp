@@ -1,31 +1,24 @@
 /*
 * Copyright 2021 gitlost
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "oned/ODCode128Reader.h"
+#include "oned/ODCode128Patterns.h"
 
-#include "DecodeHints.h"
-#include "Result.h"
+#include "ReaderOptions.h"
+#include "Barcode.h"
 
 #include "gtest/gtest.h"
+
+#include <initializer_list>
+#include <utility>
 
 using namespace ZXing;
 using namespace ZXing::OneD;
 
 // Helper to call decodePattern()
-static Result parse(const int startPattern, PatternRow row)
+static Barcode parse(const int startPattern, PatternRow row)
 {
 	if (startPattern == 'A') {
 		row.insert(row.begin(), { 0, 2, 1, 1, 4, 1, 2 });
@@ -37,10 +30,105 @@ static Result parse(const int startPattern, PatternRow row)
 	row.insert(row.end(), { 2, 3, 3, 1, 1, 1, 2, 0 }); // Stop pattern
 
 	std::unique_ptr<Code128Reader::DecodingState> state;
-	DecodeHints hints;
-	Code128Reader reader(hints);
+	ReaderOptions opts;
+	Code128Reader reader(opts);
 	PatternView next(row);
 	return reader.decodePattern(0, next, state);
+}
+
+static Barcode parse(const int startPattern, std::initializer_list<int> codes)
+{
+	PatternRow row;
+	for (int code : codes)
+		for (auto width : Code128::CODE_PATTERNS[code])
+			row.push_back(width);
+	return parse(startPattern, std::move(row));
+}
+
+TEST(ODCode128ReaderTest, SymbologyIdentifier)
+{
+	{
+		// Plain "2001"
+		PatternRow row({ 2, 2, 1, 2, 3, 1, 2, 2, 2, 1, 2, 2, 3, 1, 1, 2, 2, 2 });
+		auto result = parse('C', row);
+		EXPECT_EQ(result.symbologyIdentifier(), "]C0");
+		EXPECT_EQ(result.text(), "2001");
+	}
+
+	{
+		// GS1 "(20)01"
+		PatternRow row({ 4, 1, 1, 1, 3, 1, 2, 2, 1, 2, 3, 1, 2, 2, 2, 1, 2, 2, 1, 3, 2, 1, 3, 1 });
+		auto result = parse('C', row);
+		EXPECT_EQ(result.symbologyIdentifier(), "]C1");
+		EXPECT_EQ(result.text(TextMode::HRI), "(20)01");
+	}
+
+	{
+		// AIM "A FNC1 B"
+		PatternRow row({ 1, 1, 1, 3, 2, 3, 4, 1, 1, 1, 3, 1, 1, 3, 1, 1, 2, 3, 2, 1, 2, 3, 2, 1 });
+		auto result = parse('B', row);
+		EXPECT_EQ(result.symbologyIdentifier(), "]C2");
+		EXPECT_EQ(result.text(), "AB");
+	}
+
+	{
+		// AIM "z FNC1 B"
+		PatternRow row({ 2, 1, 4, 1, 2, 1, 4, 1, 1, 1, 3, 1, 1, 3, 1, 1, 2, 3, 4, 2, 1, 2, 1, 1 });
+		auto result = parse('B', row);
+		EXPECT_EQ(result.symbologyIdentifier(), "]C2");
+		EXPECT_EQ(result.text(), "zB");
+	}
+
+	{
+		// AIM "99 FNC1 A"
+		PatternRow row({ 1, 1, 3, 1, 4, 1, 4, 1, 1, 1, 3, 1, 1, 1, 4, 1, 3, 1, 1, 1, 1, 3, 2, 3, 1, 2, 3, 1, 2, 2 });
+		auto result = parse('C', row);
+		EXPECT_EQ(result.symbologyIdentifier(), "]C2");
+		EXPECT_EQ(result.text(), "99A");
+	}
+
+	{
+		// Bad AIM Application Indicator "? FNC1 B"
+		PatternRow row({ 2, 1, 2, 3, 2, 1, 4, 1, 1, 1, 3, 1, 1, 3, 1, 1, 2, 3, 3, 2, 2, 2, 1, 1 });
+		auto result = parse('B', row);
+		EXPECT_EQ(result.symbologyIdentifier(), "]C0"); // Just ignoring, not giving FormatError
+		EXPECT_EQ(result.text(), "?<GS>B");
+	}
+
+	{
+		// Double initial FNC1s "FNC1 FNC1" - only drop first (GS1) not both
+		PatternRow row({ 4, 1, 1, 1, 3, 1, 4, 1, 1, 1, 3, 1, 4, 1, 1, 1, 3, 1 });
+		auto result = parse('B', row);
+		EXPECT_EQ(result.symbologyIdentifier(), "]C1");
+		EXPECT_EQ(result.text(), "<GS>");
+	}
+
+	{
+		// AIM "A FNC1 FNC1" - only drop first (AIM) not both
+		PatternRow row({ 1, 1, 1, 3, 2, 3, 4, 1, 1, 1, 3, 1, 4, 1, 1, 1, 3, 1, 3, 2, 2, 2, 1, 1 });
+		auto result = parse('B', row);
+		EXPECT_EQ(result.symbologyIdentifier(), "]C2");
+		EXPECT_EQ(result.text(), "A<GS>");
+	}
+}
+
+TEST(ODCode128ReaderTest, ChecksumFunctionCodesDoNotAffectResult)
+{
+	// Start B, "As": the checksum is FNC2 (104 + 33 + 2 * 83 = 303 mod 103 = 97).
+	auto fnc2Checksum = parse('B', { 33, 83, 97 });
+	EXPECT_EQ(fnc2Checksum.symbologyIdentifier(), "]C0");
+	EXPECT_FALSE(fnc2Checksum.readerInit());
+	EXPECT_EQ(fnc2Checksum.text(), "As");
+
+	// Start C, switch to B: the checksum is FNC1 (105 + 100 = 102 mod 103).
+	auto fnc1Checksum = parse('C', { 100, 102 });
+	EXPECT_EQ(fnc1Checksum.symbologyIdentifier(), "]C0");
+	EXPECT_TRUE(fnc1Checksum.text().empty());
+
+	// Start B, DEL: the checksum is FNC3 (104 + 95 = 96 mod 103).
+	auto fnc3Checksum = parse('B', { 95, 96 });
+	EXPECT_FALSE(fnc3Checksum.readerInit());
+	EXPECT_EQ(fnc3Checksum.text(), std::string(1, '\x7f'));
 }
 
 TEST(ODCode128ReaderTest, ReaderInit)
@@ -48,21 +136,36 @@ TEST(ODCode128ReaderTest, ReaderInit)
 	{
 		// Null
 		PatternRow row({ 1, 1, 1, 1, 4, 3, 1, 3, 1, 1, 4, 1 });
-		EXPECT_FALSE(parse('C', row).readerInit());
-		EXPECT_EQ(parse('C', row).text(), L"92");
+		auto result = parse('C', row);
+		EXPECT_FALSE(result.readerInit());
+		EXPECT_EQ(result.text(), "92");
 	}
 
 	{
 		// Set (FNC3 first)
 		PatternRow row({ 1, 1, 4, 3, 1, 1, 1, 1, 3, 1, 4, 1, 1, 1, 1, 1, 4, 3, 3, 3, 1, 1, 2, 1 });
-		EXPECT_TRUE(parse('B', row).readerInit());
-		EXPECT_EQ(parse('B', row).text(), L"92");
+		auto result = parse('B', row);
+		EXPECT_TRUE(result.readerInit());
+		EXPECT_EQ(result.text(), "92");
 	}
 
 	{
 		// Set (FNC3 between "9" and "2" )
 		PatternRow row({ 3, 2, 1, 1, 2, 2, 1, 1, 4, 3, 1, 1, 2, 2, 3, 2, 1, 1, 1, 2, 1, 4, 2, 1 });
-		EXPECT_TRUE(parse('B', row).readerInit());
-		EXPECT_EQ(parse('B', row).text(), L"92");
+		auto result = parse('B', row);
+		EXPECT_TRUE(result.readerInit());
+		EXPECT_EQ(result.text(), "92");
 	}
 }
+
+#if ZXING_ENABLE_UNICODE
+TEST(ODCode128ReaderTest, ISO8859_1)
+{
+	{
+		// "aé<U+A0>" (NBSP)
+		PatternRow row({ 1, 2, 1, 1, 2, 4, 1, 1, 4, 1, 3, 1, 1, 4, 2, 1, 1, 2, 1, 1, 4, 1, 3, 1, 2, 1, 2, 2, 2, 2, 2, 2, 1, 4, 1, 1 });
+		auto result = parse('B', row);
+		EXPECT_EQ(result.text(), "a\u00E9\u00A0");
+	}
+}
+#endif // ZXING_ENABLE_UNICODE

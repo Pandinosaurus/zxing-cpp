@@ -1,28 +1,20 @@
-#pragma once
 /*
 * Copyright 2016 Nu-book Inc.
 * Copyright 2016 ZXing authors
 * Copyright 2020 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 #include "BitArray.h"
-#include "DecodeStatus.h"
 #include "Pattern.h"
+#include "BarcodeData.h"
+#include "ZXAlgorithms.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <iterator>
 #include <limits>
@@ -48,7 +40,7 @@ RSSExp.:  v?-74d/?-41c
 
 namespace ZXing {
 
-class Result;
+class ReaderOptions;
 
 namespace OneD {
 
@@ -58,19 +50,21 @@ namespace OneD {
 */
 class RowReader
 {
+protected:
+	const ReaderOptions& _opts;
+
 public:
+	explicit RowReader(const ReaderOptions& opts) : _opts(opts) {}
+	explicit RowReader(ReaderOptions&&) = delete;
 
 	struct DecodingState
 	{
 		virtual ~DecodingState() = default;
 	};
 
-	//TODO: this is only testing code -> move outside of this interface (and remove rowNumber parameter)
-	Result decodeSingleRow(int rowNumber, const BitArray& row) const;
+	virtual ~RowReader() = default;
 
-	virtual ~RowReader() {}
-
-	virtual Result decodePattern(int rowNumber, PatternView& next, std::unique_ptr<DecodingState>& state) const = 0;
+	virtual BarcodeData decodePattern(int rowNumber, PatternView& next, std::unique_ptr<DecodingState>& state) const = 0;
 
 	/**
 	 * Determines how closely a set of observed counts of runs of black/white values matches a given
@@ -85,8 +79,8 @@ public:
 	template <typename CP, typename PP>
 	static float PatternMatchVariance(const CP* counters, const PP* pattern, size_t length, float maxIndividualVariance)
 	{
-		int total = std::accumulate(counters, counters+length, 0);
-		int patternLength = std::accumulate(pattern, pattern+length, 0);
+		int total = Reduce(counters, counters + length, 0);
+		int patternLength = Reduce(pattern, pattern + length, 0);
 		if (total < patternLength) {
 			// If we don't even have one pixel per unit of bar width, assume this is too small
 			// to reliably match, so fail:
@@ -118,7 +112,7 @@ public:
 	* digit.
 	*
 	* @param counters the counts of runs of observed black/white/black/... values
-	* @param patterns the list of patterns to compare the contens of counters to
+	* @param patterns the list of patterns to compare the contents of counters to
 	* @param requireUnambiguousMatch the 'best match' must be better than all other matches
 	* @return The decoded digit index, -1 if no pattern matched
 	*/
@@ -153,20 +147,20 @@ public:
 	 */
 	static BarAndSpaceI NarrowWideThreshold(const PatternView& view)
 	{
-		BarAndSpaceI m = {std::numeric_limits<BarAndSpaceI::value_type>::max(),
-						  std::numeric_limits<BarAndSpaceI::value_type>::max()};
-		BarAndSpaceI M = {0, 0};
-		for (int i = 0; i < view.size(); ++i) {
-			m[i] = std::min(m[i], view[i]);
-			M[i] = std::max(M[i], view[i]);
-		}
+		BarAndSpaceI m = {view[0], view[1]};
+		BarAndSpaceI M = m;
+		for (int i = 2; i < view.size(); ++i)
+			UpdateMinMax(m[i], M[i], view[i]);
+
+		// the max-spread check between bar/space depends on whether both have seen narrow and wide
+		int maxSpread = M[0] >= 2 * m[0] && M[1] >= 2 * m[1] ? 2 : 4;
 
 		BarAndSpaceI res;
 		for (int i = 0; i < 2; ++i) {
 			// check that
 			//  a) wide <= 4 * narrow
-			//  b) bars and spaces are not more than a factor of 2 (or 3 for the max) apart from each other
-			if (M[i] > 4 * (m[i] + 1) || M[i] > 3 * M[i + 1] || m[i] > 2 * (m[i + 1] + 1))
+			//  b) bars and spaces are not more than a factor of spread apart from each other
+			if (M[i] > 4 * (m[i] + 1) || M[i] > maxSpread * M[i + 1] || m[i] > maxSpread * (m[i + 1] + 1))
 				return {};
 			// the threshold is the average of min and max but at least 1.5 * min
 			res[i] = std::max((m[i] + M[i]) / 2, m[i] * 3 / 2);
@@ -196,16 +190,6 @@ public:
 	}
 
 	/**
-	 * @brief each bar/space is 1-4 modules wide, we have N bars/spaces, they are SUM modules wide in total
-	 */
-	template <int LEN, int SUM>
-	static int OneToFourBitPattern(const PatternView& view)
-	{
-		// TODO: make sure none of the elements in the normalized pattern exceeds 4
-		return ToInt(NormalizedPattern<LEN, SUM>(view));
-	}
-
-	/**
 	 * @brief Lookup the pattern in the table and return the character in alphabet at the same index.
 	 * @returns 0 if pattern is not found. Used to be -1 but that fails on systems where char is unsigned.
 	 */
@@ -222,6 +206,17 @@ public:
 		return LookupBitPattern(NarrowWideBitPattern(view), table, alphabet);
 	}
 };
+
+template<typename Range>
+Barcode DecodeSingleRow(const RowReader& reader, const Range& range)
+{
+	PatternRow row;
+	GetPatternRow(range, row);
+	PatternView view(row);
+
+	std::unique_ptr<RowReader::DecodingState> state;
+	return {reader.decodePattern(0, view, state)};
+}
 
 } // OneD
 } // ZXing

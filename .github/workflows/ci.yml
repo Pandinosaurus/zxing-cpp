@@ -11,103 +11,388 @@ on:
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest, macOS-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
       # don't cancel all jobs just because one of them failed
       fail-fast: false
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: nuget-${{ runner.os }}-${{ hashFiles('wrappers/dotnet/**/*.csproj') }}
+        restore-keys: nuget-${{ runner.os }}-
+
     - name: Setup Python 3
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v6
       with:
         python-version: '3.x'
-    - name: Create Build Environment
-      # Some projects don't allow in-source building, so create a separate build directory
-      # We'll use this as our working directory for all subsequent commands
-      run: cmake -E make_directory ${{runner.workspace}}/build
 
-    - name: Configure CMake
-      working-directory: ${{runner.workspace}}/build
-      # Use a bash shell so we can use the same syntax for environment variable
-      # access regardless of the host operating system
+    - name: Setup sccache
+      if: runner.os == 'Windows'
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Setup MSVC environment
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1 # puts the real cl.exe on PATH for sccache
+
+    - name: Configure sccache for MSBuild
+      if: runner.os == 'Windows'
       shell: bash
-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBUILD_UNIT_TESTS=ON -DBUILD_PYTHON_MODULE=ON
+      run: |
+        dir="$(cygpath -m "$RUNNER_TEMP")/sccache-bin"
+        mkdir -p "$dir"
+        cp "$SCCACHE_PATH" "$dir/cl.exe"
+        echo "set(CMAKE_VS_GLOBALS \"CLToolExe=cl.exe;CLToolPath=$dir;TrackFileAccess=false;UseMultiToolTask=true\" CACHE STRING \"\")" > "$RUNNER_TEMP/sccache.cmake"
+
+    - name: Setup ccache
+      if: runner.os != 'Windows'
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ matrix.os }}
+
+    - name: Configure
+      run: >
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_SHARED_LIBS=ON
+        -DZXING_BLACKBOX_TESTS=ON -DZXING_TEST_DOTNET=ON -DZXING_TEST_GO=ON -DZXING_TEST_INSTALL=ON -DZXING_UNIT_TESTS=ON
+        -DZXING_PYTHON_MODULE=ON -DZXING_DISABLE_PCH=ON
+        ${{ runner.os == 'Windows' && format('-C {0}/sccache.cmake', runner.temp) || '' }}
+        ${{ runner.os != 'Windows' && '-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
 
     - name: Build
-      working-directory: ${{runner.workspace}}/build
-      shell: bash
-      # Execute the build.  You can specify a specific target with "--target <NAME>"
-      run: cmake --build . -j8 --config $BUILD_TYPE
+      run: cmake --build build --parallel --config ${{env.BUILD_TYPE}} ${{ runner.os == 'Windows' && '-- /v:m /clp:Summary' || '' }}
+
+    - name: Set PATH for Tests
+      shell: bash # to make the $GITHUB_PATH update work
+      if: runner.os == 'Windows'
+      run: |
+        echo "${GITHUB_WORKSPACE}/build/core/${BUILD_TYPE}" >> $GITHUB_PATH
+        echo "${GITHUB_WORKSPACE}/build/bin/${BUILD_TYPE}" >> $GITHUB_PATH
 
     - name: Test
-      working-directory: ${{runner.workspace}}/build
+      run: ctest --test-dir build -V -C ${{env.BUILD_TYPE}}
+
+    - name: Install
+      run: |
+        cmake -E make_directory install
+        cmake --install build --config ${{env.BUILD_TYPE}} --prefix ${{github.workspace}}/install
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: ${{matrix.os}}-artifacts
+        path: install
+
+  build-exp:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest, ubuntu-24.04-arm, macos-15-intel, windows-11-arm]
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Setup Python 3
+      id: setup-python
+      if: matrix.os == 'windows-11-arm' # the default python on the arm runner is an x64 build
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.13'
+        architecture: arm64
+
+    - name: Setup sccache
+      if: runner.os == 'Windows'
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Setup MSVC environment
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1 # puts the real cl.exe on PATH for sccache
+      with:
+        arch: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+
+    - name: Configure sccache for MSBuild
+      if: runner.os == 'Windows'
       shell: bash
-      # Execute tests defined by the CMake configuration.
-      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-      run: ctest -V -C $BUILD_TYPE
+      run: |
+        dir="$(cygpath -m "$RUNNER_TEMP")/sccache-bin"
+        mkdir -p "$dir"
+        cp "$SCCACHE_PATH" "$dir/cl.exe"
+        echo "set(CMAKE_VS_GLOBALS \"CLToolExe=cl.exe;CLToolPath=$dir;TrackFileAccess=false;UseMultiToolTask=true\" CACHE STRING \"\")" > "$RUNNER_TEMP/sccache.cmake"
+
+    - name: Setup ccache
+      if: runner.os != 'Windows'
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ matrix.os }}-exp
+
+    - name: Configure
+      run: >
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_SHARED_LIBS=ON
+        -DZXING_READERS=ON -DZXING_WRITERS=BOTH -DZXING_EXPERIMENTAL_API=ON
+        -DZXING_BLACKBOX_TESTS=ON -DZXING_TEST_INSTALL=ON -DZXING_UNIT_TESTS=ON -DZXING_PYTHON_MODULE=ON -DZXING_DISABLE_PCH=ON
+        ${{ runner.os == 'Windows' && format('-C {0}/sccache.cmake', runner.temp) || '' }}
+        ${{ runner.os != 'Windows' && '-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
+        ${{ steps.setup-python.outputs.python-path != '' && format('-DPython_EXECUTABLE={0}', steps.setup-python.outputs.python-path) || '' }}
+
+    - name: Build
+      run: cmake --build build --parallel --config ${{env.BUILD_TYPE}} ${{ runner.os == 'Windows' && '-- /v:m /clp:Summary' || '' }}
+
+    - name: Set PATH for Tests
+      shell: bash # to make the $GITHUB_PATH update work
+      if: runner.os == 'Windows'
+      run: |
+        echo "${GITHUB_WORKSPACE}/build/core/${BUILD_TYPE}" >> $GITHUB_PATH
+        echo "${GITHUB_WORKSPACE}/build/bin/${BUILD_TYPE}" >> $GITHUB_PATH
+
+    - name: Test
+      run: ctest --test-dir build -V -C ${{env.BUILD_TYPE}}
+
+    - name: Install
+      run: |
+        cmake -E make_directory install
+        cmake --install build --config ${{env.BUILD_TYPE}} --prefix ${{github.workspace}}/install
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: ${{matrix.os}}-exp-artifacts
+        path: install
+
+  build-ubuntu-gcc-12: # keep homebrew happy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Install GCC 12
+      run: sudo apt-get update && sudo apt-get install -y gcc-12 g++-12 doxygen
+
+    - name: Configure
+      run: >
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        -DZXING_DOXYGEN=ON
+        -DZXING_WRITERS=BOTH
+        -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_C_COMPILER=gcc-12
+
+    - name: Build
+      run: |
+        cmake --build build --parallel
+        cmake --build build --parallel --target docs
+
+    - name: Test
+      run: ctest -V --test-dir build
+
+  build-ubuntu-asan-ubsan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ubuntu-asan-ubsan
+
+    - name: Configure
+      run: >
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DZXING_WRITERS=BOTH
+        -DZXING_BLACKBOX_TESTS=ON -DZXING_UNIT_TESTS=ON -DZXING_PYTHON_MODULE=OFF -DZXING_C_API=OFF
+        -DZXING_DISABLE_PCH=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER=clang++
+        -DCMAKE_CXX_FLAGS="-march=x86-64-v3 -fsanitize=address,undefined -fno-optimize-sibling-calls -fsanitize-address-use-after-scope -fno-omit-frame-pointer -fno-sanitize-recover=all"
+        -DCMAKE_C_COMPILER=clang
+        -DCMAKE_C_FLAGS="-march=x86-64-v3 -fsanitize=address,undefined -fno-optimize-sibling-calls -fsanitize-address-use-after-scope -fno-omit-frame-pointer -fno-sanitize-recover=all"
+
+    - name: Build
+      run: cmake --build build --parallel
+
+    - name: Test
+      run: ctest -V --test-dir build
+
+  build-ubuntu-tsan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Configure
+      run: >
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DZXING_WRITERS=OFF -DZXING_EXAMPLES=OFF
+        -DZXING_BLACKBOX_TESTS=ON -DZXING_UNIT_TESTS=OFF -DZXING_PYTHON_MODULE=OFF -DZXING_C_API=OFF
+        -DCMAKE_CXX_COMPILER=clang++
+        -DCMAKE_CXX_FLAGS="-march=x86-64-v3 -fsanitize=thread -fno-optimize-sibling-calls -fno-omit-frame-pointer -g -fno-sanitize-recover=all"
+        -DCMAKE_C_COMPILER=clang
+        -DCMAKE_C_FLAGS="-march=x86-64-v3 -fsanitize=thread -fno-optimize-sibling-calls -fno-omit-frame-pointer -g -fno-sanitize-recover=all"
+
+    - name: Build
+      run: cmake --build build --parallel
+
+    - name: Test
+      run: ctest -V --test-dir build
+
+  build-old-writers:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Configure
+      run: >
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        -DZXING_READERS=ON -DZXING_WRITERS=OLD -DZXING_PYTHON_MODULE=ON -DZXING_C_API=ON
+        -DZXING_BLACKBOX_TESTS=ON -DZXING_TEST_INSTALL=ON -DZXING_UNIT_TESTS=ON -DZXING_PYTHON_MODULE=ON
+
+    - name: Build
+      run: cmake --build build --parallel
+
+    - name: Test
+      run: ctest -V --test-dir build
+
+  build-ios:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Build the swift package
+      run: swift build
+
+    - name: Build the demo app
+      working-directory: wrappers/ios/demo
+      run: xcodebuild build -scheme demo -sdk "iphonesimulator"
+
+    # - name: Validate the Pod
+    #   run: pod lib lint --allow-warnings
 
   build-android:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v5
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: android
 
     - name: Build the lib/app
       working-directory: wrappers/android
-      run: ./gradlew assembleDebug # build only the debug version of the aar (faster build)
+      # PRs only build arm64 to save time; master builds all ABIs
+      run: ./gradlew assembleRelease -PuseCcache ${{ github.event_name == 'pull_request' && '-PabiFilters=arm64-v8a' || '' }}
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v6
       with:
         name: android-artifacts
-        path: "wrappers/android/zxingcpp/build/outputs/aar/zxingcpp-debug.aar"
+        path: "wrappers/android/zxingcpp/build/outputs/aar/zxingcpp-release.aar"
 
-  build-wasm:
+    - name: Publish Library Snapshot
+      if: github.repository == 'zxing-cpp/zxing-cpp' && github.event_name != 'pull_request'
+      working-directory: wrappers/android
+      env:
+        ORG_GRADLE_PROJECT_publishSnapshot: true
+        ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALUSERNAME }}
+        ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALPASSWORD }}
+        ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_KEY }}
+        ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.GPG_KEY_ID }}
+        ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_KEY_PASSWORD }}
+      run: ./gradlew publishToMavenCentral --no-configuration-cache
+
+  build-kn:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wrappers/kn
+
     steps:
-    - uses: actions/checkout@v2
-    - uses: mymindstorm/setup-emsdk@v7
-
-    - name: Configure
-      run: emcmake cmake -Swrappers/wasm -Bbuild
-
-    - name: Build
-      run: cmake --build build -j4
-
-#    - name: Test
-#      run: node build/EmGlueTests.js
-
-    - uses: actions/upload-artifact@v2
+    - name: Checkout repository
+      uses: actions/checkout@v6
       with:
-        name: wasm-artifacts
-        path: "build/zxing*"
+        submodules: true
+
+    - name: Prepare Zig toolchain
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.13.0
+
+    - name: Checkout toolchain initializer repository
+      uses: actions/checkout@v6
+      with:
+        repository: ISNing/kn-toolchain-initializer
+        path: wrappers/kn/.kn-toolchain-initializer
+
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: 17
+        distribution: temurin
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v5
+
+    - name: Validate Gradle Wrapper
+      uses: gradle/actions/wrapper-validation@v5
+
+    - name: Initialize Kotlin/Native toolchain
+      working-directory: wrappers/kn/.kn-toolchain-initializer
+      run: ./gradlew build -DkotlinVersion=2.2.0
+
+    - name: Run test for linuxX64 target
+      run: |
+        echo -e "konan.dir=$HOME/.konan/kotlin-native-prebuilt-linux-x86_64-2.2.0" >> local.properties
+        ./gradlew linuxX64Test
 
   build-python:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        python-version: [3.7, 3.8, 3.9]
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: macos-latest
+            python-version: '3.13'
+          - os: windows-latest
+            python-version: '3.15'
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
 
     - name: Install dependencies
-      working-directory: wrappers/python
       run: |
         python -m pip install --upgrade pip
-        python -m pip install numpy pillow
+        python -m pip install numpy pillow build
 
     - name: Build module
       working-directory: wrappers/python
@@ -116,3 +401,121 @@ jobs:
     - name: Test module
       working-directory: wrappers/python
       run: python -m unittest -v
+
+    - name: Build wheel
+      working-directory: wrappers/python
+      run: python -m build --wheel
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: ${{matrix.os}}-python-artifacts
+        path: wrappers/python/dist/*
+
+  build-rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wrappers/rust
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Lint
+      run: |
+        cargo fmt --check
+        cargo clippy -- -Dwarnings
+
+    - name: Build
+      run: cargo build --release --verbose --all-features --examples
+
+    - name: Test
+      run: cargo test --release --all-features
+
+    - name: Package
+      # --allow-dirty is required on the windows build (but not the ubuntu build?!)
+      run: |
+        cargo package --all-features
+        cargo publish --dry-run
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: rust-artifacts
+        path: wrappers/rust/target/package/*.crate
+
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - uses: emscripten-core/setup-emsdk@v15
+
+    - name: Configure
+      run: emcmake cmake -Swrappers/wasm -Bbuild
+
+    - name: Build
+      run: cmake --build build --parallel
+
+#    - name: Test
+#      run: node build/EmGlueTests.js
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: wasm-artifacts
+        path: |
+            build/zxing*
+            build/demo*
+
+# disable WinRT build for now, as it does not compile with C++20 (see wrappers/winrt/CMakeLists.txt)
+  # build-winrt:
+  #   runs-on: windows-latest
+
+  #   steps:
+  #   - uses: actions/checkout@v6
+  #     with:
+  #       submodules: true
+
+  #   - name: Configure
+  #     shell: cmd # powershell messes up the arguments containing a '.' ?!?
+  #     run: >
+  #       cmake -S wrappers/winrt -B build -A ARM64
+  #       -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0 -DCMAKE_BUILD_TYPE=Release
+  #       -DBUILD_WINRT_LIB=ON -DZXING_EXAMPLES=OFF -DZXING_BLACKBOX_TESTS=OFF -DZXING_C_API=OFF
+  #       -DEXTENSION_SDK_OUTPUT=dist/UAP/v0.8.0.0/ExtensionSDKs/ZXingWinRT/1.0.0.0
+
+  #   - name: Build
+  #     run: cmake --build build -j8 --config Release
+
+  #   - uses: actions/upload-artifact@v6
+  #     with:
+  #       name: winrt-ARM64-artifacts
+  #       path: build/dist
+
+  build-tarball:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Build
+      run: python .github/create_release_archive.py
+
+    - name: Find generated archives
+      id: find
+      run: |
+        tgz=$(ls zxing-cpp-*.tar.gz 2>/dev/null | head -n1 || true)
+        zip=$(ls zxing-cpp-*.zip 2>/dev/null | head -n1 || true)
+        echo "tgz=$tgz" >> $GITHUB_OUTPUT
+        echo "zip=$zip" >> $GITHUB_OUTPUT
+
+    - name: Upload source_artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: source_artifacts
+        path: |
+          ${{ steps.find.outputs.tgz }}
+          ${{ steps.find.outputs.zip }}

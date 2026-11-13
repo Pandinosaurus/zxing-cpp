@@ -1,26 +1,21 @@
-#pragma once
 /*
 * Copyright 2020 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
+#include <string>
 
 namespace ZXing {
 
+/**
+ * @brief A simple 2D point class template.
+ *
+ * PointT is a simple 2D point class template with direct access to its x and y coordinate members.
+ */
 template <typename T>
 struct PointT
 {
@@ -28,7 +23,7 @@ struct PointT
 	T x = 0, y = 0;
 
 	constexpr PointT() = default;
-	constexpr PointT(T x, T y) : x(x), y(y) {}
+	constexpr PointT(T xx, T yy) : x(xx), y(yy) {}
 
 	template <typename U>
 	constexpr explicit PointT(const PointT<U>& p) : x(static_cast<T>(p.x)), y(static_cast<T>(p.y))
@@ -42,6 +37,11 @@ struct PointT
 		return *this;
 	}
 };
+
+using PointI = PointT<int>;
+using PointF = PointT<double>;
+
+/// @cond INTERNAL
 
 template <typename T>
 bool operator==(const PointT<T>& a, const PointT<T>& b)
@@ -114,7 +114,15 @@ T sumAbsComponent(PointT<T> p)
 template <typename T>
 auto length(PointT<T> p) -> decltype(std::sqrt(dot(p, p)))
 {
+#if 0
+	// approximation of sqrt(x^2+y^2) with maximum error of <0.4%
+	auto m = std::abs(p.x), M = std::abs(p.y);
+	if (m > M)
+		std::swap(m, M);
+	return 0.9604 * M + 0.3978 * m;
+#else
 	return std::sqrt(dot(p, p));
+#endif
 }
 
 /// L-inf norm
@@ -130,8 +138,35 @@ auto distance(PointT<T> a, PointT<T> b) -> decltype(length(a - b))
 	return length(a - b);
 }
 
-using PointI = PointT<int>;
-using PointF = PointT<double>;
+template <typename T>
+PointF normalized(PointT<T> d)
+{
+	return PointF(d) / length(PointF(d));
+}
+
+template <typename T>
+PointT<T> bresenhamDirection(PointT<T> d)
+{
+	return d / maxAbsComponent(d);
+}
+
+template <typename T>
+PointT<T> mainDirection(PointT<T> d)
+{
+	return std::abs(d.x) > std::abs(d.y) ? PointT<T>(d.x, 0) : PointT<T>(0, d.y);
+}
+
+template <typename T>
+PointT<T> right(PointT<T> d)
+{
+	return {-d.y, d.x};
+}
+
+template <typename T>
+PointT<T> left(PointT<T> d)
+{
+	return {d.y, -d.x};
+}
 
 /// Calculate a floating point pixel coordinate representing the 'center' of the pixel.
 /// This is sort of the inverse operation of the PointI(PointF) conversion constructor.
@@ -146,25 +181,13 @@ inline PointF centered(PointF p)
 	return {std::floor(p.x) + 0.5f, std::floor(p.y) + 0.5f};
 }
 
-template <typename T>
-PointF normalized(PointT<T> d)
-{
-	return PointF(d) / length(d);
-}
+/// @endcond
 
 template <typename T>
-PointT<T> bresenhamDirection(PointT<T> d)
+std::string ToString(const PointT<T>& p, bool swap = false, char delim = 'x')
 {
-	return d / maxAbsComponent(d);
+	return std::to_string(swap ? p.y : p.x) + delim + std::to_string(swap ? p.x : p.y);
 }
-
-template <typename T>
-PointT<T> mainDirection(PointT<T> d)
-{
-	assert(std::abs(d.x) != std::abs(d.y));
-	return std::abs(d.x) > std::abs(d.y) ? PointT<T>(d.x, 0) : PointT<T>(0, d.y);
-}
-
 
 } // ZXing
 

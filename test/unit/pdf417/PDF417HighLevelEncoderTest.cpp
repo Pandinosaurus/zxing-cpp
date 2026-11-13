@@ -1,19 +1,8 @@
 /*
 * Copyright 2017 Huy Cuong Nguyen
 * Copyright (C) 2014 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "CharacterSet.h"
 #include "pdf417/PDFCompaction.h"
@@ -35,7 +24,7 @@ TEST(PDF417HighLevelEncoderTest, EncodeAutoWithSpecialChars)
 	//Just check if this does not throw an exception
 	HighLevelEncoder::EncodeHighLevel(L"1%\xA7""s ?aG$", Compaction::AUTO, CharacterSet::UTF8);
 }
-  
+
 TEST(PDF417HighLevelEncoderTest, EncodeIso88591WithSpecialChars)
 {
 	// Just check if this does not throw an exception
@@ -44,7 +33,7 @@ TEST(PDF417HighLevelEncoderTest, EncodeIso88591WithSpecialChars)
 
 TEST(PDF417HighLevelEncoderTest, EncodeText)
 {
-    auto encoded = HighLevelEncoder::EncodeHighLevel(L"ABCD", Compaction::TEXT, CharacterSet::UTF8);
+	auto encoded = HighLevelEncoder::EncodeHighLevel(L"ABCD", Compaction::TEXT, CharacterSet::UTF8);
 	EXPECT_EQ(encoded, std::vector<int>({ 0x39f, 0x1a, 1, '?' }));
 }
 
@@ -69,4 +58,10 @@ TEST(PDF417HighLevelEncoderTest, EncodeByteBINARYECI)
 TEST(PDF417HighLevelEncoderTest, EncodeByteUnknown)
 {
 	EXPECT_THROW(HighLevelEncoder::EncodeHighLevel(L"\u00E9", Compaction::BYTE, CharacterSet::Unknown), std::invalid_argument);
+}
+
+TEST(PDF417HighLevelEncoderTest, Bug1166)
+{
+	auto encoded = HighLevelEncoder::EncodeHighLevel(L"äöü", Compaction::BYTE, CharacterSet::UTF8);
+	EXPECT_EQ(encoded, std::vector<int>({ 927, 26, 924, 327, 778, 695, 708, 444 }));
 }

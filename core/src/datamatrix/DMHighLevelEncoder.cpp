@@ -1,19 +1,8 @@
 /*
 * Copyright 2016 Huy Cuong Nguyen
 * Copyright 2016 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "DMHighLevelEncoder.h"
 
@@ -21,7 +10,7 @@
 #include "CharacterSet.h"
 #include "DMEncoderContext.h"
 #include "TextEncoder.h"
-#include "ZXContainerAlgorithms.h"
+#include "ZXAlgorithms.h"
 
 #include <algorithm>
 #include <array>
@@ -30,7 +19,6 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
-#include <numeric>
 #include <stdexcept>
 #include <string>
 
@@ -42,10 +30,6 @@ static const uint8_t MACRO_05 = 236;
 static const uint8_t MACRO_06 = 237;
 static const uint8_t C40_UNLATCH = 254;
 static const uint8_t X12_UNLATCH = 254;
-
-static const std::wstring MACRO_05_HEADER = L"[)>\x1E""05\x1D";
-static const std::wstring MACRO_06_HEADER = L"[)>\x1E""06\x1D";
-static const std::wstring MACRO_TRAILER = L"\x1E\x04";
 
 enum
 {
@@ -66,11 +50,6 @@ static const uint8_t LATCHES[] = {
 	231, // LATCH_TO_BASE256,
 };
 
-static bool IsDigit(int ch)
-{
-	return ch >= '0' && ch <= '9';
-}
-
 static bool IsExtendedASCII(int ch)
 {
 	return ch >= 128 && ch <= 255;
@@ -78,12 +57,12 @@ static bool IsExtendedASCII(int ch)
 
 static bool IsNativeC40(int ch)
 {
-	return (ch == ' ') || (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z');
+	return (ch == ' ') || IsDigit(ch) || IsUpper(ch);
 }
 
 static bool IsNativeText(int ch)
 {
-	return (ch == ' ') || (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z');
+	return (ch == ' ') || IsDigit(ch) || IsLower(ch);
 }
 
 static bool IsX12TermSep(int ch)
@@ -95,7 +74,7 @@ static bool IsX12TermSep(int ch)
 
 static bool IsNativeX12(int ch)
 {
-	return IsX12TermSep(ch) || (ch == ' ') || (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z');
+	return IsX12TermSep(ch) || (ch == ' ') || IsDigit(ch) || IsUpper(ch);
 }
 
 static bool IsNativeEDIFACT(int ch)
@@ -127,7 +106,7 @@ static uint8_t Randomize253State(uint8_t ch, int codewordPosition)
 {
 	int pseudoRandom = ((149 * codewordPosition) % 253) + 1;
 	int tempVariable = ch + pseudoRandom;
-	return static_cast<uint8_t>(tempVariable <= 254 ? tempVariable : (tempVariable - 254));
+	return narrow_cast<uint8_t>(tempVariable <= 254 ? tempVariable : (tempVariable - 254));
 }
 
 static int FindMinimums(const std::array<int, 6>& intCharCounts, int min, std::array<int, 6>& mins)
@@ -168,7 +147,8 @@ static int LookAheadTest(const std::string& msg, size_t startpos, int currentMod
 		//step K
 		if ((startpos + charsProcessed) == msg.length()) {
 			int min = std::numeric_limits<int>::max();
-			std::transform(charCounts.begin(), charCounts.end(), intCharCounts.begin(), [](float x) { return static_cast<int>(std::ceil(x)); });
+			std::transform(charCounts.begin(), charCounts.end(), intCharCounts.begin(),
+						   [](float x) { return static_cast<int>(std::ceil(x)); });
 			min = FindMinimums(intCharCounts, min, mins);
 			int minCount = Reduce(mins);
 
@@ -260,7 +240,8 @@ static int LookAheadTest(const std::string& msg, size_t startpos, int currentMod
 
 		//step R
 		if (charsProcessed >= 4) {
-			std::transform(charCounts.begin(), charCounts.end(), intCharCounts.begin(), [](float x) { return static_cast<int>(std::ceil(x)); });
+			std::transform(charCounts.begin(), charCounts.end(), intCharCounts.begin(),
+						   [](float x) { return static_cast<int>(std::ceil(x)); });
 			FindMinimums(intCharCounts, std::numeric_limits<int>::max(), mins);
 			int minCount = Reduce(mins);
 
@@ -331,7 +312,7 @@ namespace ASCIIEncoder {
 	static int DetermineConsecutiveDigitCount(const std::string& msg, int startpos)
 	{
 		auto begin = msg.begin() + startpos;
-		return static_cast<int>(std::find_if_not(begin, msg.end(), IsDigit) - begin);
+		return narrow_cast<int>(std::find_if_not(begin, msg.end(), IsDigit<char>) - begin);
 	}
 
 	static uint8_t EncodeASCIIDigits(int digit1, int digit2)
@@ -382,11 +363,11 @@ namespace C40Encoder {
 			sb.push_back('\3');
 			return 1;
 		}
-		if (c >= '0' && c <= '9') {
+		if (IsDigit(c)) {
 			sb.push_back((char)(c - 48 + 4));
 			return 1;
 		}
-		if (c >= 'A' && c <= 'Z') {
+		if (IsUpper(c)) {
 			sb.push_back((char)(c - 65 + 14));
 			return 1;
 		}
@@ -421,7 +402,8 @@ namespace C40Encoder {
 		return len;
 	}
 
-	static int BacktrackOneCharacter(EncoderContext& context, std::string& buffer, std::string& removed, int lastCharSize, std::function<int (int, std::string&)> encodeChar)
+	static int BacktrackOneCharacter(EncoderContext& context, std::string& buffer, std::string& removed, int lastCharSize,
+									 const std::function<int(int, std::string&)>& encodeChar)
 	{
 		buffer.resize(buffer.size() - lastCharSize);
 		context.setCurrentPos(context.currentPos() - 1);
@@ -436,8 +418,8 @@ namespace C40Encoder {
 		int c2 = sb.at(startPos + 1);
 		int c3 = sb.at(startPos + 2);
 		int v = (1600 * c1) + (40 * c2) + c3 + 1;
-		context.addCodeword(static_cast<uint8_t>(v / 256));
-		context.addCodeword(static_cast<uint8_t>(v % 256));
+		context.addCodeword(narrow_cast<uint8_t>(v / 256));
+		context.addCodeword(narrow_cast<uint8_t>(v % 256));
 	}
 
 	static void WriteNextTriplet(EncoderContext& context, std::string& buffer)
@@ -494,7 +476,7 @@ namespace C40Encoder {
 		context.setNewEncoding(ASCII_ENCODATION);
 	}
 
-	static void EncodeC40(EncoderContext& context, std::function<int (int, std::string&)> encodeChar, int encodingMode)
+	static void EncodeC40(EncoderContext& context, const std::function<int (int, std::string&)>& encodeChar, int encodingMode)
 	{
 		//step C
 		std::string buffer;
@@ -502,7 +484,7 @@ namespace C40Encoder {
 			int c = context.currentChar();
 			context.setCurrentPos(context.currentPos() + 1);
 			int lastCharSize = encodeChar(c, buffer);
-			int unwritten = static_cast<int>(buffer.length() / 3) * 2;
+			int unwritten = narrow_cast<int>(buffer.length() / 3) * 2;
 			int curCodewordCount = context.codewordCount() + unwritten;
 			auto symbolInfo = context.updateSymbolInfo(curCodewordCount);
 			int available = symbolInfo->dataCapacity() - curCodewordCount;
@@ -546,11 +528,11 @@ namespace DMTextEncoder {
 			sb.push_back('\3');
 			return 1;
 		}
-		if (c >= '0' && c <= '9') {
+		if (IsDigit(c)) {
 			sb.push_back((char)(c - 48 + 4));
 			return 1;
 		}
-		if (c >= 'a' && c <= 'z') {
+		if (IsLower(c)) {
 			sb.push_back((char)(c - 97 + 14));
 			return 1;
 		}
@@ -607,26 +589,16 @@ namespace X12Encoder {
 	static int EncodeChar(int c, std::string& sb)
 	{
 		switch (c) {
-		case '\r':
-			sb.push_back('\0');
-			break;
-		case '*':
-			sb.push_back('\1');
-			break;
-		case '>':
-			sb.push_back('\2');
-			break;
-		case ' ':
-			sb.push_back('\3');
-			break;
+		case '\r': sb.push_back('\0'); break;
+		case '*': sb.push_back('\1'); break;
+		case '>': sb.push_back('\2'); break;
+		case ' ': sb.push_back('\3'); break;
 		default:
-			if (c >= '0' && c <= '9') {
+			if (IsDigit(c)) {
 				sb.push_back((char)(c - 48 + 4));
-			}
-			else if (c >= 'A' && c <= 'Z') {
+			} else if (IsUpper(c)) {
 				sb.push_back((char)(c - 65 + 14));
-			}
-			else {
+			} else {
 				throw std::invalid_argument("Illegal character: " + ToHexString(c));
 			}
 			break;
@@ -700,17 +672,17 @@ namespace EdifactEncoder {
 		int c4 = len >= 4 ? sb.at(startPos + 3) : 0;
 
 		int v = (c1 << 18) + (c2 << 12) + (c3 << 6) + c4;
-		int cw1 = (v >> 16) & 255;
-		int cw2 = (v >> 8) & 255;
-		int cw3 = v & 255;
+		uint8_t cw1 = (v >> 16) & 255;
+		uint8_t cw2 = (v >> 8) & 255;
+		uint8_t cw3 = v & 255;
 		ByteArray res;
 		res.reserve(3);
-		res.push_back(static_cast<uint8_t>(cw1));
+		res.push_back(cw1);
 		if (len >= 2) {
-			res.push_back(static_cast<uint8_t>(cw2));
+			res.push_back(cw2);
 		}
 		if (len >= 3) {
-			res.push_back(static_cast<uint8_t>(cw3));
+			res.push_back(cw3);
 		}
 		return res;
 	}
@@ -863,19 +835,9 @@ namespace Base256Encoder {
 
 } // Base256Encoder
 
-static bool StartsWith(const std::wstring& s, const std::wstring& ss)
-{
-	return s.length() > ss.length() && s.compare(0, ss.length(), ss) == 0;
-}
-
-static bool EndsWith(const std::wstring& s, const std::wstring& ss)
-{
-	return s.length() > ss.length() && s.compare(s.length() - ss.length(), ss.length(), ss) == 0;
-}
-
 ByteArray Encode(const std::wstring& msg)
 {
-	return Encode(msg, SymbolShape::NONE, -1, -1, -1, -1);
+	return Encode(msg, CharacterSet::ISO8859_1, SymbolShape::NONE, -1, -1, -1, -1);
 }
 
 /**
@@ -889,7 +851,7 @@ ByteArray Encode(const std::wstring& msg)
 * @param maxSize the maximum symbol size constraint or null for no constraint
 * @return the encoded message (the char values range from 0 to 255)
 */
-ByteArray Encode(const std::wstring& msg, SymbolShape shape, int minWidth, int minHeight, int maxWidth, int maxHeight)
+ByteArray Encode(const std::wstring& msg, CharacterSet charset, SymbolShape shape, int minWidth, int minHeight, int maxWidth, int maxHeight)
 {
 	//the codewords 0..255 are encoded as Unicode characters
 	//Encoder[] encoders = {
@@ -897,16 +859,24 @@ ByteArray Encode(const std::wstring& msg, SymbolShape shape, int minWidth, int m
 	//	new X12Encoder(), new EdifactEncoder(),  new Base256Encoder()
 	//};
 
-	EncoderContext context(TextEncoder::FromUnicode(msg, CharacterSet::ISO8859_1));
+	if (charset == CharacterSet::Unknown) {
+		charset = CharacterSet::ISO8859_1;
+	}
+
+	EncoderContext context(TextEncoder::FromUnicode(msg, charset));
 	context.setSymbolShape(shape);
 	context.setSizeConstraints(minWidth, minHeight, maxWidth, maxHeight);
 
-	if (StartsWith(msg, MACRO_05_HEADER) && EndsWith(msg, MACRO_TRAILER)) {
+	constexpr std::wstring_view MACRO_05_HEADER = L"[)>\x1E""05\x1D";
+	constexpr std::wstring_view MACRO_06_HEADER = L"[)>\x1E""06\x1D";
+	constexpr std::wstring_view MACRO_TRAILER = L"\x1E\x04";
+
+	if (msg.starts_with(MACRO_05_HEADER) && msg.ends_with(MACRO_TRAILER)) {
 		context.addCodeword(MACRO_05);
 		context.setSkipAtEnd(2);
 		context.setCurrentPos(Size(MACRO_05_HEADER));
 	}
-	else if (StartsWith(msg, MACRO_06_HEADER) && EndsWith(msg, MACRO_TRAILER)) {
+	else if (msg.starts_with(MACRO_06_HEADER) && msg.ends_with(MACRO_TRAILER)) {
 		context.addCodeword(MACRO_06);
 		context.setSkipAtEnd(2);
 		context.setCurrentPos(Size(MACRO_06_HEADER));
@@ -915,12 +885,12 @@ ByteArray Encode(const std::wstring& msg, SymbolShape shape, int minWidth, int m
 	int encodingMode = ASCII_ENCODATION; //Default mode
 	while (context.hasMoreCharacters()) {
 		switch (encodingMode) {
-			case ASCII_ENCODATION:   ASCIIEncoder::EncodeASCII(context);     break;
-			case C40_ENCODATION:     C40Encoder::EncodeC40(context);         break;
-			case TEXT_ENCODATION:    DMTextEncoder::EncodeText(context);     break;
-			case X12_ENCODATION:     X12Encoder::EncodeX12(context);         break;
-			case EDIFACT_ENCODATION: EdifactEncoder::EncodeEdifact(context); break;
-			case BASE256_ENCODATION: Base256Encoder::EncodeBase256(context); break;
+		case ASCII_ENCODATION:   ASCIIEncoder::EncodeASCII(context);     break;
+		case C40_ENCODATION:     C40Encoder::EncodeC40(context);         break;
+		case TEXT_ENCODATION:    DMTextEncoder::EncodeText(context);     break;
+		case X12_ENCODATION:     X12Encoder::EncodeX12(context);         break;
+		case EDIFACT_ENCODATION: EdifactEncoder::EncodeEdifact(context); break;
+		case BASE256_ENCODATION: Base256Encoder::EncodeBase256(context); break;
 		}
 		if (context.newEncoding() >= 0) {
 			encodingMode = context.newEncoding();

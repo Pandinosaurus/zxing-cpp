@@ -1,19 +1,8 @@
 /*
 * Copyright 2017 Huy Cuong Nguyen
 * Copyright 2013 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "aztec/AZEncoder.h"
 #include "BitArray.h"
@@ -34,7 +23,7 @@ namespace ZXing {
 using namespace ZXing;
 
 namespace {
-	
+
 	void TestEncode(const std::string& data, bool compact, int layers, const BitMatrix& expected) {
 		Aztec::EncodeResult aztec = Aztec::Encoder::Encode(data, 33, Aztec::Encoder::DEFAULT_AZTEC_LAYERS);
 		EXPECT_EQ(aztec.compact, compact) << "Unexpected symbol format (compact)";
@@ -43,7 +32,11 @@ namespace {
 	}
 
 	std::string StripSpaces(std::string str) {
+#ifdef __cpp_lib_erase_if
+		std::erase_if(str, isspace);
+#else
 		str.erase(std::remove_if(str.begin(), str.end(), isspace), str.end());
+#endif
 		return str;
 	}
 
@@ -210,4 +203,45 @@ TEST(AZEncoderTest, BorderCompact4Case)
 	aztec = Aztec::Encoder::Encode(alphabet4.substr(0, 100), 10, Aztec::Encoder::DEFAULT_AZTEC_LAYERS);
 	EXPECT_TRUE(aztec.compact);
 	EXPECT_EQ(aztec.layers, 4);
+}
+
+
+TEST(AZEncoderTest, Rune)
+{
+	{
+		Aztec::EncodeResult aztec = Aztec::Encoder::Encode("\x19", 0, Aztec::Encoder::AZTEC_RUNE_LAYERS);
+
+		EXPECT_EQ(aztec.layers, 0);
+		EXPECT_EQ(aztec.matrix, ParseBitMatrix(
+			"X X X   X X     X   X \n"
+			"X X X X X X X X X X X \n"
+			"  X               X X \n"
+			"  X   X X X X X   X X \n"
+			"  X   X       X   X   \n"
+			"X X   X   X   X   X X \n"
+			"X X   X       X   X X \n"
+			"X X   X X X X X   X   \n"
+			"X X               X X \n"
+			"  X X X X X X X X X X \n"
+			"    X     X           \n"
+		));
+	}
+	{
+		Aztec::EncodeResult aztec = Aztec::Encoder::Encode("\xFF", 0, Aztec::Encoder::AZTEC_RUNE_LAYERS);
+
+		EXPECT_EQ(aztec.layers, 0);
+		EXPECT_EQ(aztec.matrix, ParseBitMatrix(
+			"X X   X   X   X     X \n"
+			"X X X X X X X X X X X \n"
+			"  X               X X \n"
+			"X X   X X X X X   X X \n"
+			"X X   X       X   X X \n"
+			"  X   X   X   X   X X \n"
+			"  X   X       X   X   \n"
+			"X X   X X X X X   X X \n"
+			"X X               X   \n"
+			"  X X X X X X X X X X \n"
+			"    X X     X X X     \n"
+		));
+	}
 }

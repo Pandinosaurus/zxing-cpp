@@ -1,29 +1,18 @@
 /*
 * Copyright 2016 Nu-book Inc.
 * Copyright 2016 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "MCReader.h"
 
 #include "BinaryBitmap.h"
 #include "BitMatrix.h"
-#include "DecodeHints.h"
 #include "DecoderResult.h"
+#include "DetectorResult.h"
 #include "MCBitMatrixParser.h"
 #include "MCDecoder.h"
-#include "Result.h"
+#include "BarcodeData.h"
 
 namespace ZXing::MaxiCode {
 
@@ -33,44 +22,44 @@ namespace ZXing::MaxiCode {
 * around it. This is a specialized method that works exceptionally fast in this special
 * case.
 */
-static BitMatrix ExtractPureBits(const BitMatrix& image)
+static DetectorResult ExtractPureBits(const BitMatrix& image)
 {
 	int left, top, width, height;
-	if (!image.findBoundingBox(left, top, width, height, BitMatrixParser::MATRIX_WIDTH)) {
+	if (!image.findBoundingBox(left, top, width, height, BitMatrixParser::MATRIX_WIDTH))
 		return {};
-	}
 
 	// Now just read off the bits
-	BitMatrix result(BitMatrixParser::MATRIX_WIDTH, BitMatrixParser::MATRIX_HEIGHT);
+	BitMatrix bits(BitMatrixParser::MATRIX_WIDTH, BitMatrixParser::MATRIX_HEIGHT);
 	for (int y = 0; y < BitMatrixParser::MATRIX_HEIGHT; y++) {
 		int iy = top + (y * height + height / 2) / BitMatrixParser::MATRIX_HEIGHT;
 		for (int x = 0; x < BitMatrixParser::MATRIX_WIDTH; x++) {
 			int ix = left + (x * width + width / 2 + (y & 0x01) *  width / 2) / BitMatrixParser::MATRIX_WIDTH;
 			if (image.get(ix, iy)) {
-				result.set(x, y);
+				bits.set(x, y);
 			}
 		}
 	}
-	return result;
+
+	return {std::move(bits), Rectangle<PointI>(left, top, width, height)};
 }
 
-Reader::Reader(const DecodeHints& hints) : _isPure(hints.isPure()), _characterSet(hints.characterSet()) {}
-
-Result
-Reader::decode(const BinaryBitmap& image) const
+BarcodesData Reader::read(const BinaryBitmap& image, [[maybe_unused]] int maxSymbols) const
 {
 	auto binImg = image.getBitMatrix();
-	if (binImg == nullptr) {
-		return Result(DecodeStatus::NotFound);
-	}
+	if (binImg == nullptr)
+		return {};
 
 	//TODO: this only works with effectively 'pure' barcodes. Needs proper detector.
-	BitMatrix bits = ExtractPureBits(*binImg);
-	if (bits.empty()) {
-		return Result(DecodeStatus::NotFound);
-	}
+	auto detRes = ExtractPureBits(*binImg);
+	if (!detRes.isValid())
+		return {};
 
-	return Result(Decoder::Decode(bits, _characterSet), {}, BarcodeFormat::MaxiCode);
+	DecoderResult decRes = Decode(detRes.bits());
+	// TODO: before we can meaningfully return a ChecksumError result, we need to check the center for the presence of the finder pattern
+	if (!decRes.isValid())
+		return {};
+
+	return ToVector(MatrixBarcode(std::move(decRes), std::move(detRes), BarcodeFormat::MaxiCode));
 }
 
 } // namespace ZXing::MaxiCode

@@ -1,112 +1,58 @@
-/*
-* Copyright 2016 Nu-book Inc.
-* Copyright 2019 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+// Copyright 2026 Axel Waggershauser
+// SPDX-License-Identifier: Apache-2.0
 
 #include "BlackboxTestRunner.h"
 
+#include "ByteArray.h"
 #include "ImageLoader.h"
 #include "ReadBarcode.h"
-#include "TextUtfEncoding.h"
-#include "ThresholdBinarizer.h"
-#include "ZXContainerAlgorithms.h"
-#include "pdf417/PDFReader.h"
-#include "qrcode/QRReader.h"
+#include "StdPrint.h"
+#include "Utf.h"
+#include "Version.h"
+#include "ZXAlgorithms.h"
 
-#include <fmt/core.h>
-#include <fmt/ostream.h>
-
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <exception>
+#include <format>
 #include <fstream>
 #include <map>
 #include <optional>
-#include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#ifndef PRINT_DEBUG
+#include <future>
+#endif
+
 namespace ZXing::Test {
 
-namespace {
-
-	struct PureTag {} pure;
-
-	struct TestCase
-	{
-		struct TC
-		{
-			std::string name = {};
-			int minPassCount = 0; // The number of images which must decode for the test to pass.
-			int maxMisreads = 0; // Maximum number of successfully read images with the wrong contents.
-			std::set<fs::path> notDetectedFiles = {};
-			std::map<fs::path, std::string> misReadFiles = {};
-		};
-
-		TC tc[2] = {};
-		int rotation = 0; // The rotation in degrees clockwise to use for this test.
-
-		TestCase(int mntf, int mnts, int mmf, int mms, int r)
-			: tc{{"fast", mntf, mmf}, {"slow", mnts, mms}}, rotation(r)
-		{}
-		TestCase(int mntf, int mnts, int r) : TestCase(mntf, mnts, 0, 0, r) {}
-		TestCase(int mntp, int mmp, PureTag) : tc{{"pure", mntp, mmp}} {}
-	};
-
-	struct FalsePositiveTestCase
-	{
-		int maxAllowed; // Maximum number of images which can fail due to successfully reading the wrong contents
-		int rotation;   // The rotation in degrees clockwise to use for this test.
-	};
-}
-
-static std::string checkResult(const fs::path& imgPath, std::string_view expectedFormat, const Result& result)
-{
-	if (auto format = ToString(result.format()); expectedFormat != format)
-		return fmt::format("Format mismatch: expected '{}' but got '{}'", expectedFormat, format);
-
-	auto readFile = [imgPath](const char* ending) {
-		std::ifstream ifs(fs::path(imgPath).replace_extension(ending), std::ios::binary);
-		return ifs ? std::optional(std::string(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>())) : std::nullopt;
-	};
-
-	if (auto expected = readFile(".txt")) {
-		auto utf8Result = TextUtfEncoding::ToUtf8(result.text());
-		return utf8Result != *expected ? fmt::format("Content mismatch: expected '{}' but got '{}'", *expected, utf8Result) : "";
-	}
-
-	if (auto expected = readFile(".bin")) {
-		std::string latin1Result(result.text().length(), '\0');
-		std::transform(result.text().begin(), result.text().end(), latin1Result.begin(), [](wchar_t c) { return static_cast<char>(c); });
-		return latin1Result != *expected ? fmt::format("Content mismatch: expected '{}' but got '{}'", *expected, latin1Result) : "";
-	}
-
-	return "Error reading file";
-}
-
 static int failed = 0;
+static int extra = 0;
 static int totalImageLoadTime = 0;
+static double totalUEC = 0;
 
-int timeSince(std::chrono::steady_clock::time_point startTime)
+static std::string Abbrev(std::string_view str, size_t maxLength)
+{
+	return str.size() <= maxLength ? std::string(str) : std::string(str.substr(0, maxLength)) + "...";
+}
+
+static bool isImage(const fs::path& path)
+{
+	return Contains({".webp", ".png", ".jpg", ".pgm", ".gif"}, path.extension());
+}
+
+static int timeSince(std::chrono::steady_clock::time_point startTime)
 {
 	auto duration = std::chrono::steady_clock::now() - startTime;
-	return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
+	return narrow_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
 }
 
 // pre-load images into cache, so the disc io time does not end up in the timing measurement
-void preloadImageCache(const std::vector<fs::path>& imgPaths)
+static void preloadImageCache(const std::vector<fs::path>& imgPaths)
 {
 	auto startTime = std::chrono::steady_clock::now();
 	ImageLoader::clearCache();
@@ -115,35 +61,12 @@ void preloadImageCache(const std::vector<fs::path>& imgPaths)
 	totalImageLoadTime += timeSince(startTime);
 }
 
-static void printPositiveTestStats(int imageCount, const TestCase::TC& tc)
-{
-	int passCount = imageCount - Size(tc.misReadFiles) - Size(tc.notDetectedFiles);
-
-	fmt::print(" | {}: {:3} of {:3}, misread {} of {}", tc.name, passCount, tc.minPassCount, Size(tc.misReadFiles),
-			   tc.maxMisreads);
-
-	if (passCount < tc.minPassCount && !tc.notDetectedFiles.empty()) {
-		fmt::print("\nFAILED: Not detected ({}):", tc.name);
-		for (const auto& f : tc.notDetectedFiles)
-			fmt::print(" {}", f.filename().string());
-		fmt::print("\n");
-		++failed;
-	}
-
-	if (Size(tc.misReadFiles) > tc.maxMisreads) {
-		fmt::print("\nFAILED: Read error ({}):", tc.name);
-		for (const auto& [path, error] : tc.misReadFiles)
-			fmt::print("      {}: {}\n", path.filename().string(), error);
-		++failed;
-	}
-}
-
 static std::vector<fs::path> getImagesInDirectory(const fs::path& directory)
 {
 	std::vector<fs::path> result;
 	for (const auto& entry : fs::directory_iterator(directory))
-		if (fs::is_regular_file(entry.status()) &&
-				Contains({".png", ".jpg", ".pgm", ".gif"}, entry.path().extension()))
+		if (fs::is_regular_file(entry.status())
+			&& Contains({".webp", ".png", ".jpg", ".jpeg", ".pgm", ".gif"}, entry.path().extension()))
 			result.push_back(entry.path());
 
 	preloadImageCache(result);
@@ -151,461 +74,412 @@ static std::vector<fs::path> getImagesInDirectory(const fs::path& directory)
 	return result;
 }
 
-static void doRunTests(
-	const fs::path& directory, std::string_view format, int totalTests, const std::vector<TestCase>& tests, DecodeHints hints)
+enum class TestMode { Slow, Fast, Pure };
+
+std::string ToString(TestMode mode)
 {
-	auto imgPaths = getImagesInDirectory(directory);
-	auto folderName = directory.stem();
+	return EnumToString(mode, {"slow", "fast", "pure"});
+}
 
-	if (Size(imgPaths) != totalTests)
-		fmt::print("TEST {} => Expected number of tests: {}, got: {} => FAILED\n", folderName, totalTests,
-				   imgPaths.size());
+struct TestFilter
+{
+	bool modes[3 * 4] = {}; // slow, fast, pure x 0, 90, 180, 270 degrees
 
-	for (auto& test : tests) {
-		fmt::print("{:20} @ {:3}, {:3}", folderName.string(), test.rotation, Size(imgPaths));
-		std::vector<int> times;
-		for (auto tc : test.tc) {
-			if (tc.name.empty())
-				break;
-			auto startTime = std::chrono::steady_clock::now();
-			hints.setTryHarder(tc.name == "slow");
-			hints.setTryRotate(tc.name == "slow");
-			hints.setIsPure(tc.name == "pure");
-			if (hints.isPure())
-				hints.setBinarizer(Binarizer::FixedThreshold);
-			for (const auto& imgPath : imgPaths) {
-				auto result = ReadBarcode(ImageLoader::load(imgPath).rotated(test.rotation), hints);
-				if (result.isValid()) {
-					auto error = checkResult(imgPath, format, result);
-					if (!error.empty())
-						tc.misReadFiles[imgPath] = error;
-				} else {
-					tc.notDetectedFiles.insert(imgPath);
+	bool& operator()(TestMode mode, int rotation)
+	{
+		if (static_cast<int>(mode) < 0 || static_cast<int>(mode) >= 3 || rotation < 0 || rotation > 3)
+			throw std::out_of_range("Invalid mode or rotation");
+		return modes[static_cast<int>(mode) * 4 + rotation];
+	}
+	bool operator()(TestMode mode, int rotation) const { return const_cast<TestFilter*>(this)->operator()(mode, rotation); }
+
+	void operator|=(const TestFilter& other) { std::ranges::transform(modes, other.modes, modes, std::logical_or<>{}); }
+	void operator&=(const TestFilter& other) { std::ranges::transform(modes, other.modes, modes, std::logical_and<>{}); }
+
+	TestFilter operator!() const
+	{
+		TestFilter res;
+		std::ranges::transform(modes, res.modes, std::logical_not<>{});
+		return res;
+	}
+};
+
+static TestFilter parseTestFilter(std::string_view value)
+{
+	TestFilter result;
+	TestMode mode = static_cast<TestMode>(-1);
+
+	for (char c : value) {
+		switch (c) {
+		case ' ': break;
+		case 's': mode = TestMode::Slow; break;
+		case 'f': mode = TestMode::Fast; break;
+		case 'p': mode = TestMode::Pure; break;
+		case '0': [[fallthrough]];
+		case '1': [[fallthrough]];
+		case '2': [[fallthrough]];
+		case '3': result(mode, c - '0') = true; break;
+		case 'h': result(mode, 0) = result(mode, 2) = true; break;
+		case 'v': result(mode, 1) = result(mode, 3) = true; break;
+		case 'a':
+			for (int r : {0, 1, 2, 3})
+				result(mode, r) = true;
+			break;
+		default: throw std::invalid_argument(std::format("Invalid search/find char '{}' in '{}'", c, value));
+		}
+	}
+	return result;
+}
+
+using Properties = std::map<std::string, std::string>;
+
+static std::optional<std::string> readFile(const fs::path& path)
+{
+	std::ifstream ifs(path, std::ios::binary);
+	return ifs ? std::optional(std::string(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>())) : std::nullopt;
+}
+
+static std::string parseTomlValue(std::string_view value, const fs::path& path, std::string_view key)
+{
+	auto hexDigit = [](char c) {
+		if (c >= '0' && c <= '9')
+			return c - '0';
+		if (c >= 'a' && c <= 'f')
+			return c - 'a' + 10;
+		if (c >= 'A' && c <= 'F')
+			return c - 'A' + 10;
+		return -1;
+	};
+
+	value = TrimWS(value);
+	if (value.size() < 2 || value.front() != '"' || value.back() != '"')
+		return std::string(value);
+
+	std::string result;
+	for (size_t i = 1; i + 1 < value.size(); ++i) {
+		char c = value[i];
+		if (c != '\\') {
+			result.push_back(c);
+			continue;
+		}
+
+		auto parseHexCodepoint = [&](int digitCount) {
+			if (i + digitCount >= value.size())
+				throw std::invalid_argument(std::format("{}: invalid unicode escape in '{}'", path.string(), key));
+			uint32_t codepoint = 0;
+			for (int j = 0; j < digitCount; ++j) {
+				int digit = hexDigit(value[++i]);
+				if (digit < 0)
+					throw std::invalid_argument(std::format("{}: invalid unicode escape in '{}'", path.string(), key));
+				codepoint = (codepoint << 4) | static_cast<uint32_t>(digit);
+			}
+			return codepoint;
+		};
+
+		if (i + 1 >= value.size() - 1)
+			throw std::invalid_argument(std::format("{}: invalid escape in '{}'", path.string(), key));
+		char next = value[++i];
+		switch (next) {
+		case '"': result.push_back('"'); break;
+		case '\\': result.push_back('\\'); break;
+		case 'b': result.push_back('\b'); break;
+		case 't': result.push_back('\t'); break;
+		case 'n': result.push_back('\n'); break;
+		case 'f': result.push_back('\f'); break;
+		case 'r': result.push_back('\r'); break;
+		case 'u': AppendToUtf8(result, parseHexCodepoint(4)); break;
+		case 'U': AppendToUtf8(result, parseHexCodepoint(8)); break;
+		default: throw std::invalid_argument(std::format("{}: unsupported escape in '{}'", path.string(), key));
+		}
+	}
+	return result;
+}
+
+static std::vector<Properties> readToml(const fs::path& path, const Properties& folderDefaults = {})
+{
+	auto content = readFile(path);
+	if (!content)
+		return {folderDefaults};
+
+	std::vector<Properties> records;
+	auto defaults = folderDefaults;
+	auto current = defaults;
+	bool atTopLevel = true;
+	std::stringstream lines(*content);
+	std::string rawLine;
+	while (std::getline(lines, rawLine)) {
+		auto line = TrimWS(rawLine);
+		if (line.empty() || line.front() == '#')
+			continue;
+		if (line == "[[symbol]]") {
+			if (std::exchange(atTopLevel, false))
+				defaults = current; // top-level key/value pairs are defaults for all subsequent records
+			else
+				records.push_back(std::exchange(current, defaults));
+			continue;
+		}
+		if (line.front() == '[')
+			throw std::invalid_argument(std::format("{}: only [[symbol]] tables are supported", path.string()));
+		auto equals = line.find('=');
+		if (equals == std::string_view::npos)
+			throw std::invalid_argument(std::format("{}: invalid TOML line '{}'", path.string(), line));
+		auto key = TrimWS(line.substr(0, equals));
+		auto value = parseTomlValue(line.substr(equals + 1), path, key);
+		if (key.empty())
+			throw std::invalid_argument(std::format("{}: invalid TOML line '{}'", path.string(), line));
+		// std::println("Parsed TOML line '{}': '{}' = '{}'", rawLine, key, value);
+		current[std::string(key)] = std::move(value);
+	}
+	records.push_back(std::move(current));
+	return records;
+}
+
+static std::vector<Properties> readTestConfig(const fs::path& imagePath, const Properties& defaults)
+{
+	auto dataPath = imagePath;
+	while (!fs::exists(dataPath.replace_extension(".toml")) && !fs::exists(dataPath.replace_extension(".txt"))) {
+		auto stem = dataPath.stem().string();
+		auto sep = stem.find_last_of("-_!");
+		if (sep == std::string::npos)
+			break;
+		dataPath.replace_filename(stem.substr(0, sep));
+	}
+
+	std::vector<Properties> ret = {defaults};
+	if (dataPath.extension() == ".toml")
+		ret = readToml(dataPath, defaults);
+	else if (dataPath.extension() == ".txt") {
+		if (auto text = readFile(dataPath))
+			ret.front().insert_or_assign("TextEscaped", EscapeNonGraphical(*text));
+	}
+
+	auto stem = imagePath.stem().string();
+	if (stem.ends_with("!") || !fs::exists(dataPath)) {
+		ret.front().insert_or_assign("missing", "sa fa pa");
+	} else if (stem.ends_with("!f")) {
+		ret.front().insert_or_assign("missing", "fa pa");
+	} else if (stem.ends_with("!p")) {
+		ret.front().insert_or_assign("missing", "pa");
+	}
+
+	// std::println("Test config for {} = {}: {}", imagePath.string(), dataPath.string(), ret.front().size());
+
+	return ret;
+}
+
+struct Test
+{
+	fs::path imgPath;
+	std::vector<Properties> props;
+	ReaderOptions opts;
+	TestFilter search;
+	std::array<std::vector<Barcode>, 4> found;
+
+	std::optional<std::string> prop(const std::string& key, int idx = 0) const
+	{
+		auto it = props[idx].find(key);
+		return it != props[idx].end() ? std::optional<std::string>{it->second} : std::nullopt;
+	}
+
+	Test(fs::path imgPath, const Properties& defaults)
+		: imgPath(std::move(imgPath)), props(readTestConfig(this->imgPath, defaults))
+	{
+		opts.tryDownscale(false);
+		if (auto val = prop("formats"))
+			opts.formats(BarcodeFormats(*val));
+		if (auto val = prop("eanAddOnSymbol"))
+			opts.eanAddOnSymbol(*val == "require" ? EanAddOnSymbol::Require
+								: *val == "read"  ? EanAddOnSymbol::Read
+												  : EanAddOnSymbol::Ignore);
+		if (auto val = prop("maxNumberOfSymbols"))
+			opts.maxNumberOfSymbols(std::stoi(*val));
+		if (auto val = prop("returnErrors"))
+			opts.returnErrors(*val == "true");
+		if (auto val = prop("tryDownscale"))
+			opts.tryDownscale(*val == "true");
+		if (auto val = prop("tryDenoise"))
+			opts.tryDenoise(*val == "true");
+
+		search = parseTestFilter(*prop("find"));
+		if (auto val = prop("search"))
+			search |= parseTestFilter(*val);
+	}
+
+	void run(TestMode mode)
+	{
+		auto opts = this->opts;
+		if (mode == TestMode::Fast)
+			opts.tryHarder(false).tryRotate(false).tryInvert(false);
+		if (mode == TestMode::Pure)
+			opts.binarizer(Binarizer::FixedThreshold).isPure(true);
+		// opts.maxNumberOfSymbols(1);
+
+		for (int rotation : {0, 1, 2, 3}) {
+			if (search(mode, rotation))
+				found[rotation] = ReadBarcodes(ImageLoader::load(imgPath).rotated(rotation * 90), opts);
+			else
+				found[rotation].clear();
+			// std::println("    {} @ {}/{:3} => found {} barcodes", imgPath.filename().string(), ToString(mode), rotation * 90,
+			// Size(found[rotation]));
+		}
+	}
+};
+
+static void runBlackBoxTestDirectory(const fs::path& directory)
+{
+	auto stem = directory.stem().string();
+	if (auto pos = stem.find_first_of('-'); pos != std::string::npos)
+		stem = stem.substr(0, pos);
+	auto format = BarcodeFormat::None;
+	try {
+		format = BarcodeFormatFromString(stem);
+	} catch (...) {
+	}
+
+	Properties defaults;
+	defaults["find"] = format & BarcodeFormat::AllLinear ? "sh fh" : "sa fh";
+	defaults["Format"] = Name(format);
+
+	defaults = readToml(directory / "!defaults.toml", defaults).front();
+	auto imagePaths = getImagesInDirectory(directory);
+	std::vector<Test> tests;
+	for (const auto& imagePath : imagePaths)
+		tests.emplace_back(imagePath, defaults);
+
+	std::map<fs::path, std::map<std::string, TestFilter>> missing, unexpected;
+
+	std::string modeSummaries;
+	for (auto mode : {TestMode::Slow, TestMode::Fast, TestMode::Pure}) {
+		auto startTime = std::chrono::steady_clock::now();
+#ifndef PRINT_DEBUG
+		auto futures = std::vector<std::future<void>>{};
+		for (auto& test : tests)
+			futures.push_back(std::async(std::launch::async, [&] { test.run(mode); }));
+		for (auto& f : futures)
+			f.wait();
+#else
+		for (auto& test : tests)
+			test.run(mode);
+#endif
+		int decodeTime = timeSince(startTime);
+		std::array<int, 4> numFound{};
+
+		for (auto& test : tests) {
+			for (int rotation : {0, 1, 2, 3}) {
+				numFound.at(rotation) += Size(test.found.at(rotation));
+				auto found = test.found.at(rotation);
+				for (auto& barcode : found) {
+					if (!barcode.extra("UEC").empty())
+						totalUEC += std::stod(barcode.extra("UEC"));
+				}
+
+				if (auto val = test.prop("SequenceIndex", Size(test.props) - 1); val == "-1" && !found.empty())
+					found.push_back(MergeStructuredAppendSequence(found));
+
+				for (const auto& expected : test.props) {
+					if (!(BarcodeFormatFromString(expected.at("Format")) & BarcodeFormat::AllReadable))
+						continue;
+					auto expectAt = parseTestFilter(expected.at("find"));
+					if (expected.contains("missing"))
+						expectAt &= !parseTestFilter(expected.at("missing"));
+					if (!expectAt(mode, rotation))
+						continue;
+#if !ZXING_ENABLE_UNICODE
+					std::wstring txt;
+					if (expected.contains("TextPlain"))
+						txt = FromUtf8(expected.at("TextPlain"));
+					if (expected.contains("TextEscaped"))
+						txt = FromUtf8(expected.at("TextEscaped"));
+					if (std::ranges::any_of(txt, [](wchar_t c) { return static_cast<unsigned int>(c) > 255; }))
+						continue;
+#endif
+
+					// search expected in found, if not in found, report missing
+					auto it = std::ranges::find_if(found, [&](const auto& barcode) {
+						for (const auto& [key, value] : expected) {
+							if (IsUpper(key.front()) && !value.empty() && barcode.extra(key) != value) {
+								// println("    Mismatch for key '{}': expected '{}' but got '{}'", key, value, barcode.extra(key));
+								return false;
+							}
+						}
+						return true;
+					});
+					if (it == found.end()) {
+						std::string str;
+						for (const auto& [key, value] : expected)
+							str += std::format(" {}=\"{}\"", key, Abbrev(EscapeNonGraphical(value), 30));
+						missing[test.imgPath][str](mode, rotation) = true;
+						failed++;
+					} else {
+						found.erase(it);
+					}
+				}
+
+				for (const auto& barcode : found) {
+					auto str = std::format("{}: \"{}\", Extra: {}", EnumName(barcode.format()),
+										   Abbrev(barcode.text(TextMode::Escaped), 30), barcode.extra());
+#if !ZXING_ENABLE_UNICODE
+					if (barcode.text().empty())
+						continue;
+#endif
+					unexpected[test.imgPath][str](mode, rotation) = true;
 				}
 			}
-
-			times.push_back(timeSince(startTime));
-			printPositiveTestStats(Size(imgPaths), tc);
 		}
-		fmt::print(" | time: {:3} vs {:3} ms\n", times.front(), times.back());
+
+		modeSummaries += std::format("| {}: {:2} {:2} {:2} {:2}  -> {:3}ms ", ToString(mode), numFound[0], numFound[1],
+									 numFound[2], numFound[3], decodeTime);
 	}
-}
+	std::println("{:20} {:3} images {}", directory.stem().string(), Size(imagePaths), modeSummaries);
 
-static auto readPDF417s = [](const BinaryBitmap& image) { return Pdf417::Reader({}).decodeMultiple(image); };
-static auto readQRCodes = [](const BinaryBitmap& image) { return std::list{QRCode::Reader({}).decode(image)}; };
-
-template<typename READER>
-static Result readMultiple(const std::vector<fs::path>& imgPaths, int rotation, READER read)
-{
-	std::list<Result> allResults;
-	for (const auto& imgPath : imgPaths) {
-		auto results = read(ThresholdBinarizer(ImageLoader::load(imgPath), 127));
-		allResults.insert(allResults.end(), results.begin(), results.end());
-	}
-
-	if (allResults.empty())
-		return Result(DecodeStatus::NotFound);
-
-	allResults.sort([](const Result& r1, const Result& r2) { return r1.sequenceIndex() < r2.sequenceIndex(); });
-
-	if (allResults.back().sequenceSize() != Size(allResults) ||
-		!std::all_of(allResults.begin(), allResults.end(),
-					 [&](Result& it) { return it.sequenceId() == allResults.front().sequenceId(); }))
-		return Result(DecodeStatus::FormatError);
-
-	std::wstring text;
-	for (const auto& r : allResults)
-		text.append(r.text());
-
-	return {std::move(text), {}, allResults.front().format()};
-}
-
-static void doRunStructuredAppendTest(
-	const fs::path& directory, std::string_view format, int totalTests, const std::vector<TestCase>& tests)
-{
-	auto imgPaths = getImagesInDirectory(directory);
-	auto folderName = directory.stem();
-
-	std::map<fs::path, std::vector<fs::path>> imageGroups;
-	for (const auto& imgPath : imgPaths) {
-		std::string fn = imgPath.filename().string();
-		auto p = fn.find_last_of('-');
-		imageGroups[imgPath.parent_path() / fn.substr(0, p)].push_back(imgPath);
-	}
-
-	if (Size(imageGroups) != totalTests)
-		fmt::print("TEST {} => Expected number of tests: {}, got: {} => FAILED\n", folderName, totalTests,
-				   imageGroups.size());
-
-	for (auto& test : tests) {
-		fmt::print("{:20} @ {:3}, {:3}", folderName.string(), test.rotation, Size(imgPaths));
-		auto tc = test.tc[0];
-		auto startTime = std::chrono::steady_clock::now();
-
-		for (const auto& [testPath, testImgPaths] : imageGroups) {
-			auto result = format == "QRCode" ? readMultiple(testImgPaths, test.rotation, readQRCodes)
-											 : readMultiple(testImgPaths, test.rotation, readPDF417s);
-			if (result.isValid()) {
-				auto error = checkResult(testPath, format, result);
-				if (!error.empty())
-					tc.misReadFiles[testPath] = error;
-			} else {
-				tc.notDetectedFiles.insert(testPath);
+	auto printMismatches = [&](const std::map<fs::path, std::map<std::string, TestFilter>>& mismatches, std::string_view title) {
+		for (const auto& [imagePath, expected] : mismatches) {
+			for (const auto& [expectedText, found] : expected) {
+				std::print("{:30} ", imagePath.lexically_relative(directory.parent_path()).string());
+				for (const auto mode : {TestMode::Slow, TestMode::Fast, TestMode::Pure}) {
+					std::print(" | {}:", ToString(mode));
+					for (int rotation : {0, 1, 2, 3})
+						std::print(" {:>2}", found(mode, rotation) ? 'X' : ' ');
+					std::print("          ");
+				}
+				std::println(" | {}: {}", title, expectedText);
 			}
 		}
+	};
+	printMismatches(missing, "missing");
+	printMismatches(unexpected, "unexpected");
 
-		printPositiveTestStats(Size(imageGroups), tc);
-		fmt::print(" | time: {:3} ms\n", timeSince(startTime));
-	}
+	extra += Reduce(unexpected, 0, [](int sum, const auto& p) { return sum + Size(p.second); });
 }
 
 int runBlackBoxTests(const fs::path& testPathPrefix, const std::set<std::string>& includedTests)
 {
-	auto hasTest = [&includedTests](const fs::path& dir) {
-		auto stem = dir.stem().string();
-		return includedTests.empty() || Contains(includedTests, stem) ||
-				Contains(includedTests, stem.substr(0, stem.size() - 2));
-	};
+	std::vector<fs::path> directories;
+	for (const auto& entry : fs::directory_iterator(testPathPrefix))
+		if (fs::is_directory(entry) && (includedTests.empty() || std::ranges::any_of(includedTests, [&](const auto& prefix) {
+											return entry.path().stem().string().starts_with(prefix);
+										})))
+			directories.push_back(entry.path());
+	std::ranges::sort(directories);
+	if (directories.empty())
+		directories.push_back(testPathPrefix);
 
-	auto runTests = [&](std::string_view directory, std::string_view format, int total,
-						const std::vector<TestCase>& tests, const DecodeHints& hints = DecodeHints()) {
-		if (hasTest(directory))
-			doRunTests(testPathPrefix / directory, format, total, tests, hints);
-	};
+	auto startTime = std::chrono::steady_clock::now();
+	for (const auto& directory : directories)
+		runBlackBoxTestDirectory(directory);
 
-	auto runStructuredAppendTest = [&](std::string_view directory, std::string_view format, int total, const std::vector<TestCase>& tests) {
-		if (hasTest(directory))
-			doRunStructuredAppendTest(testPathPrefix / directory, format, total, tests);
-	};
+	int totalTime = timeSince(startTime);
+	int decodeTime = totalTime - totalImageLoadTime;
+	std::println("load time:   {} ms", totalImageLoadTime);
+	std::println("decode time: {} ms", decodeTime);
+	std::println("total time:  {} ms", totalTime);
+	std::println("total UEC:   {:.10}", totalUEC);
+	if (failed)
+		std::println("WARNING: {} tests failed.", failed);
+	if (extra)
+		std::println("INFO: {} unexpected symbols found.", extra);
 
-	try
-	{
-		auto startTime = std::chrono::steady_clock::now();
-
-		// clang-format off
-		runTests("aztec-1", "Aztec", 21, {
-			{ 20, 20, 0   },
-			{ 20, 20, 90  },
-			{ 20, 20, 180 },
-			{ 20, 20, 270 },
-			{ 21, 0, pure },
-		});
-
-		runTests("aztec-2", "Aztec", 22, {
-			{ 5, 5, 0   },
-			{ 4, 4, 90  },
-			{ 6, 6, 180 },
-			{ 3, 3, 270 },
-		});
-
-		runTests("datamatrix-1", "DataMatrix", 25, {
-			{ 25, 25, 0   },
-			{  0, 25, 90  },
-			{  0, 25, 180 },
-			{  0, 25, 270 },
-			{ 24, 0, pure },
-		});
-
-		runTests("datamatrix-2", "DataMatrix", 13, {
-			{ 13, 13, 0   },
-			{  0, 13, 90  },
-			{  0, 13, 180 },
-			{  0, 13, 270 },
-		});
-
-		runTests("datamatrix-3", "DataMatrix", 19, {
-			{ 18, 19, 0   },
-			{  0, 19, 90  },
-			{  0, 19, 180 },
-			{  0, 19, 270 },
-		});
-
-		runTests("datamatrix-4", "DataMatrix", 20, {
-			{ 20, 20, 0   },
-			{  0, 20, 90  },
-			{  0, 20, 180 },
-			{  0, 20, 270 },
-			{ 18, 0, pure },
-		});
-
-		runTests("codabar-1", "Codabar", 11, {
-			{ 11, 11, 0   },
-			{ 11, 11, 180 },
-		});
-
-		runTests("codabar-2", "Codabar", 4, {
-			{ 3, 3, 0   },
-			{ 3, 3, 180 },
-		});
-
-		runTests("code39-1", "Code39", 4, {
-			{ 4, 4, 0   },
-			{ 4, 4, 180 },
-		});
-
-		runTests("code39-2", "Code39", 2, {
-			{ 2, 2, 0   },
-			{ 2, 2, 180 },
-		}, DecodeHints().setTryCode39ExtendedMode(true));
-
-		runTests("code39-3", "Code39", 12, {
-			{ 12, 12, 0   },
-			{ 12, 12, 180 },
-		});
-
-		runTests("code93-1", "Code93", 3, {
-			{ 3, 3, 0   },
-			{ 3, 3, 180 },
-		});
-
-		runTests("code128-1", "Code128", 6, {
-			{ 6, 6, 0   },
-			{ 6, 6, 180 },
-		});
-
-		runTests("code128-2", "Code128", 21, {
-			{ 19, 21, 0   },
-			{ 19, 21, 180 },
-		});
-
-		runTests("code128-3", "Code128", 2, {
-			{ 2, 2, 0   },
-			{ 2, 2, 180 },
-		});
-
-		runTests("ean8-1", "EAN-8", 8, {
-			{ 8, 8, 0   },
-			{ 8, 8, 180 },
-		});
-
-		runTests("ean13-1", "EAN-13", 31, {
-			{ 26, 29, 0   },
-			{ 23, 29, 180 },
-		});
-
-		runTests("ean13-2", "EAN-13", 24, {
-			{ 7, 14, 0   },
-			{ 7, 14, 180 },
-		});
-
-		runTests("ean13-3", "EAN-13", 21, {
-			{ 20, 21, 0   },
-			{ 21, 21, 180 },
-		});
-
-		runTests("ean13-4", "EAN-13", 22, {
-			{ 7, 14, 0   },
-			{ 8, 14, 180 },
-		});
-
-		runTests("ean13-extension-1", "EAN-13", 5, {
-			{ 4, 5, 0 },
-			{ 3, 5, 180 },
-		}, DecodeHints().setEanAddOnSymbol(EanAddOnSymbol::Require));
-
-		runTests("itf-1", "ITF", 11, {
-			{ 10, 11, 0   },
-			{ 10, 11, 180 },
-		});
-
-		runTests("itf-2", "ITF", 6, {
-			{ 6, 6, 0   },
-			{ 6, 6, 180 },
-		});
-
-		runTests("maxicode-1", "MaxiCode", 9, {
-			{ 9, 9, 0 },
-		});
-
-		runTests("maxicode-2", "MaxiCode", 4, {
-			{ 0, 0, 0 },
-		});
-
-		runTests("upca-1", "UPC-A", 12, {
-			{  9, 12, 0, 1, 0   },
-			{ 11, 12, 0, 1, 180 },
-		});
-
-		runTests("upca-2", "UPC-A", 36, {
-			{ 17, 23, 0   },
-			{ 18, 23, 180 },
-		});
-
-		runTests("upca-3", "UPC-A", 21, {
-			{ 7, 10, 0, 1, 0   },
-			{ 8, 10, 0, 1, 180 },
-		});
-
-		runTests("upca-4", "UPC-A", 19, {
-			{ 9, 11, 0, 1, 0   },
-			{ 9, 11, 0, 1, 180 },
-		});
-
-		runTests("upca-5", "UPC-A", 32, {
-			{ 17, 20, 0   },
-			{ 19, 20, 180 },
-		});
-		
-		runTests("upca-extension-1", "UPC-A", 6, {
-			{ 3, 6, 0 },
-			{ 4, 6, 180 },
-		}, DecodeHints().setEanAddOnSymbol(EanAddOnSymbol::Require));
-
-		runTests("upce-1", "UPC-E", 3, {
-			{ 3, 3, 0   },
-			{ 3, 3, 180 },
-		});
-
-		runTests("upce-2", "UPC-E", 28, {
-			{ 19, 22, 0, 1, 0   },
-			{ 20, 22, 1, 1, 180 },
-		});
-
-		runTests("upce-3", "UPC-E", 11, {
-			{ 6, 8, 0   },
-			{ 6, 8, 180 },
-		});
-
-		runTests("rss14-1", "DataBar", 6, {
-			{ 6, 6, 0   },
-			{ 6, 6, 180 },
-		});
-
-		runTests("rss14-2", "DataBar", 16, {
-			{ 8 , 10, 0   },
-			{ 10, 10, 180 },
-		});
-
-		runTests("rssexpanded-1", "DataBarExpanded", 33, {
-			{ 33, 33, 0   },
-			{ 33, 33, 180 },
-		});
-
-		runTests("rssexpanded-2", "DataBarExpanded", 15, {
-			{ 13, 15, 0   },
-			{ 13, 15, 180 },
-		});
-
-		runTests("rssexpanded-3", "DataBarExpanded", 118, {
-			{ 118, 118, 0   },
-			{ 118, 118, 180 },
-		});
-
-		runTests("rssexpandedstacked-1", "DataBarExpanded", 65, {
-			{ 60, 65, 0   },
-			{ 60, 65, 180 },
-		});
-
-		runTests("rssexpandedstacked-2", "DataBarExpanded", 7, {
-			{ 2, 7, 0   },
-			{ 2, 7, 180 },
-		});
-
-		runTests("qrcode-1", "QRCode", 16, {
-			{ 16, 16, 0   },
-			{ 16, 16, 90  },
-			{ 16, 16, 180 },
-			{ 16, 16, 270 },
-		});
-
-		runTests("qrcode-2", "QRCode", 40, {
-			{ 38, 38, 0   },
-			{ 38, 38, 90  },
-			{ 38, 38, 180 },
-			{ 38, 38, 270 },
-			{ 20, 1, pure }, // the misread is the 'outer' symbol in 16.png
-		});
-
-		runTests("qrcode-3", "QRCode", 28, {
-			{ 25, 25, 0   },
-			{ 25, 25, 90  },
-			{ 25, 25, 180 },
-			{ 24, 24, 270 },
-		});
-
-		runTests("qrcode-4", "QRCode", 41, {
-			{ 29, 29, 0   },
-			{ 29, 29, 90  },
-			{ 29, 29, 180 },
-			{ 29, 29, 270 },
-		});
-
-		runTests("qrcode-5", "QRCode", 16, {
-			{ 16, 16, 0   },
-			{ 16, 16, 90  },
-			{ 16, 16, 180 },
-			{ 16, 16, 270 },
-			{ 4, 0, pure },
-		});
-
-		runTests("qrcode-6", "QRCode", 15, {
-			{ 15, 15, 0   },
-			{ 15, 15, 90  },
-			{ 15, 15, 180 },
-			{ 15, 15, 270 },
-		});
-
-		runStructuredAppendTest("qrcode-7", "QRCode", 1, {
-			{ 1, 1, 0   },
-		});
-
-		runTests("pdf417-1", "PDF417", 17, {
-			{ 16, 16, 0   },
-			{  1,  1, 90  },
-			{ 16, 16, 180 },
-			{  1,  1, 270 },
-			{ 17, 0, pure },
-		});
-
-		runTests("pdf417-2", "PDF417", 25, {
-			{ 25, 25, 0   },
-			{ 25, 25, 180 },
-		});
-
-		runTests("pdf417-3", "PDF417", 16, {
-			{ 16, 16, 0   },
-			{ 16, 16, 180 },
-			{ 7, 0, pure },
-		});
-
-		runStructuredAppendTest("pdf417-4", "PDF417", 2, {
-			{ 2, 2, 0   },
-		});
-
-		runTests("falsepositives-1", "None", 24, {
-			{ 0, 0, 0, 0, 0   },
-			{ 0, 0, 0, 0, 90  },
-			{ 0, 0, 0, 0, 180 },
-			{ 0, 0, 0, 0, 270 },
-			{ 0, 0, pure },
-		});
-
-		runTests("falsepositives-2", "None", 25, {
-			{ 0, 0, 0, 0, 0   },
-			{ 0, 0, 0, 0, 90  },
-			{ 0, 0, 0, 0, 180 },
-			{ 0, 0, 0, 0, 270 },
-			{ 0, 0, pure },
-		});
-		// clang-format on
-
-		int totalTime = timeSince(startTime);
-		int decodeTime = totalTime - totalImageLoadTime;
-		fmt::print("load time:   {} ms.\n", totalImageLoadTime);
-		fmt::print("decode time: {} ms.\n", decodeTime);
-		fmt::print("total time:  {} ms.\n", totalTime);
-		if (failed)
-			fmt::print("WARNING: {} tests failed.\n", failed);
-
-		return failed;
-	}
-	catch (const std::exception& e) {
-		fmt::print("{}\n", e.what());
-	}
-	catch (...) {
-		fmt::print("Internal error\n");
-	}
-	return -1;
+	return failed;
 }
 
-} // ZXing::Test
+} // namespace ZXing::Test

@@ -1,25 +1,15 @@
 /*
 * Copyright 2016 Nu-book Inc.
 * Copyright 2016 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "QRDataBlock.h"
 
+#include "ByteArray.h"
 #include "QRErrorCorrectionLevel.h"
 #include "QRVersion.h"
-#include "ZXContainerAlgorithms.h"
+#include "ZXAlgorithms.h"
 
 namespace ZXing::QRCode {
 
@@ -34,6 +24,8 @@ std::vector<DataBlock> DataBlock::GetDataBlocks(const ByteArray& rawCodewords, c
 
 	// First count the total number of data blocks
 	int totalBlocks = ecBlocks.numBlocks();
+	if (totalBlocks == 0)
+		return {};
 
 	std::vector<DataBlock> result(totalBlocks);
 	// Now establish DataBlocks of the appropriate size and number of data codewords
@@ -63,10 +55,16 @@ std::vector<DataBlock> DataBlock::GetDataBlocks(const ByteArray& rawCodewords, c
 	// The last elements of result may be 1 element longer;
 	// first fill out as many elements as all of them have
 	int rawCodewordsOffset = 0;
-	for (int i = 0; i < shorterBlocksNumDataCodewords; i++) {
-		for (int j = 0; j < numResultBlocks; j++) {
-			result[j]._codewords[i] = rawCodewords[rawCodewordsOffset++];
-		}
+	if (version.isModel1()) {
+		// in Model 1 symbols the data blocks are concatenated back to back
+		for (int j = 0; j < numResultBlocks; j++)
+			for (int i = 0; i < shorterBlocksNumDataCodewords; i++)
+				result[j]._codewords[i] = rawCodewords[rawCodewordsOffset++];
+	} else {
+		// in all others, the data blocks are interleaved
+		for (int i = 0; i < shorterBlocksNumDataCodewords; i++)
+			for (int j = 0; j < numResultBlocks; j++)
+				result[j]._codewords[i] = rawCodewords[rawCodewordsOffset++];
 	}
 	// Fill out the last data block in the longer ones
 	for (int j = longerBlocksStartAt; j < numResultBlocks; j++) {
@@ -74,10 +72,19 @@ std::vector<DataBlock> DataBlock::GetDataBlocks(const ByteArray& rawCodewords, c
 	}
 	// Now add in error correction blocks
 	int max = Size(result[0]._codewords);
-	for (int i = shorterBlocksNumDataCodewords; i < max; i++) {
+	if (version.isModel1()) {
 		for (int j = 0; j < numResultBlocks; j++) {
-			int iOffset = j < longerBlocksStartAt ? i : i + 1;
-			result[j]._codewords[iOffset] = rawCodewords[rawCodewordsOffset++];
+			for (int i = shorterBlocksNumDataCodewords; i < max; i++) {
+				int iOffset = j < longerBlocksStartAt ? i : i + 1;
+				result[j]._codewords[iOffset] = rawCodewords[rawCodewordsOffset++];
+			}
+		}
+	} else {
+		for (int i = shorterBlocksNumDataCodewords; i < max; i++) {
+			for (int j = 0; j < numResultBlocks; j++) {
+				int iOffset = j < longerBlocksStartAt ? i : i + 1;
+				result[j]._codewords[iOffset] = rawCodewords[rawCodewordsOffset++];
+			}
 		}
 	}
 	return result;

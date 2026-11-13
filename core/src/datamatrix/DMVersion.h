@@ -1,20 +1,10 @@
-#pragma once
 /*
 * Copyright 2016 Nu-book Inc.
 * Copyright 2016 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 namespace ZXing::DataMatrix {
 
@@ -63,6 +53,8 @@ public:
 	int totalCodewords() const { return ecBlocks.totalDataCodewords(); }
 	int dataWidth() const { return (symbolWidth / dataBlockWidth) * dataBlockWidth; }
 	int dataHeight() const { return (symbolHeight / dataBlockHeight) * dataBlockHeight; }
+	int dataBlocksX() const { return symbolWidth / dataBlockWidth; }
+	int dataBlocksY() const { return symbolHeight / dataBlockHeight; }
 	bool isDMRE() const { return versionNumber >= 31 && versionNumber <= 48; }
 };
 
@@ -71,7 +63,7 @@ public:
  *
  * @param height Number of rows in modules
  * @param width Number of columns in modules
- * @return Version for a Data Matrix Code of those dimensions, nullputr for invalid dimensions
+ * @return Version for a Data Matrix Code of those dimensions, nullptr for invalid dimensions
  */
 const Version* VersionForDimensions(int height, int width);
 

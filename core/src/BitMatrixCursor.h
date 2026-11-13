@@ -1,27 +1,19 @@
-#pragma once
 /*
 * Copyright 2020 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 #include "BitMatrix.h"
+#include "Point.h"
+#include "StdGenerator.h"
 
-#include <array>
+#include <climits>
 
 namespace ZXing {
 
-enum class Direction {LEFT = -1, RIGHT = 1};
+enum class Direction { LEFT = -1, RIGHT = 1 };
 
 inline Direction opposite(Direction dir) noexcept
 {
@@ -37,6 +29,8 @@ inline Direction opposite(Direction dir) noexcept
 template<typename POINT>
 class BitMatrixCursor
 {
+	using this_t = BitMatrixCursor<POINT>;
+
 public:
 	const BitMatrix* img;
 
@@ -59,7 +53,6 @@ public:
 		operator bool() const noexcept { return isValid(); }
 
 		bool operator==(Value o) const { return v == o.v; }
-		bool operator!=(Value o) const { return v != o.v; }
 	};
 
 	template <typename T>
@@ -77,9 +70,9 @@ public:
 	bool isWhite() const noexcept { return whiteAt(p); }
 
 	POINT front() const noexcept { return d; }
-	POINT back() const noexcept { return {-d.x, -d.y}; }
-	POINT left() const noexcept { return {d.y, -d.x}; }
-	POINT right() const noexcept { return {-d.y, d.x}; }
+	POINT back() const noexcept { return -d; }
+	POINT left() const noexcept { return ZXing::left(d); }
+	POINT right() const noexcept { return ZXing::right(d); }
 	POINT direction(Direction dir) const noexcept { return static_cast<int>(dir) * right(); }
 
 	void turnBack() noexcept { d = back(); }
@@ -99,8 +92,8 @@ public:
 	Value edgeAtRight() const noexcept { return edgeAt(right()); }
 	Value edgeAt(Direction dir) const noexcept { return edgeAt(direction(dir)); }
 
-	void setDirection(PointF dir) { d = bresenhamDirection(dir); }
-	void setDirection(PointI dir) { d = dir; }
+	this_t& setDirection(PointF dir) { return d = bresenhamDirection(dir), *this; }
+	this_t& setDirection(PointI dir) { return d = dir, *this; }
 
 	bool step(typename POINT::value_t s = 1)
 	{
@@ -108,35 +101,32 @@ public:
 		return isIn(p);
 	}
 
-	BitMatrixCursor<POINT> movedBy(POINT d) const
-	{
-		auto res = *this;
-		res.p += d;
-		return res;
-	}
+	this_t movedBy(POINT o) const noexcept { return {*img, p + o, d}; }
+	this_t turnedBack() const noexcept { return {*img, p, back()}; }
 
 	/**
-	 * @brief stepToEdge advances cursor to one step behind the next (or n-th) edge.
+	 * @brief stepToEdge advances cursor to one step behind the next (or n-th) edge or outside the image/range.
 	 * @param nth number of edges to pass
 	 * @param range max number of steps to take
-	 * @return number of steps taken or 0 if moved outside of range/image
+	 * @param backup whether or not to backup one step so we land in front of the edge
+	 * @param acceptImageBorder whether or not to consider the image border as a valid edge
+	 * @return number of steps taken or 0 if moved outside of range
 	 */
-	int stepToEdge(int nth = 1, int range = 0)
+	int stepToEdge(int nth = 1, int range = 0, bool backup = false, bool acceptImageBorder = true)
 	{
-		// TODO: provide an alternative and faster out-of-bounds check than isIn() inside testAt()
-		int sum = 0;
+		int steps = 0;
 		auto lv = testAt(p);
 
-		while (nth && (!range || sum < range) && lv.isValid()) {
-			step();
-			++sum;
-			auto v = testAt(p);
-			if (lv != v) {
-				lv = v;
-				--nth;
-			}
+		while (nth && (!range || steps < range) && lv.isValid()) {
+			++steps;
+			auto v = testAt(p + steps * d);
+			nth -= lv != v;
+			lv = v;
 		}
-		return sum * (nth == 0);
+		if (backup && nth == 0)
+			--steps;
+		p += steps * d;
+		return steps * (nth == 0 && (acceptImageBorder || lv.isValid()));
 	}
 
 	bool stepAlongEdge(Direction dir, bool skipCorner = false)
@@ -162,11 +152,11 @@ public:
 		return ret;
 	}
 
-	int countEdges(int range = 0)
+	int countEdges(int range)
 	{
 		int res = 0;
 
-		while (int steps = stepToEdge(1, range)) {
+		while (int steps = range ? stepToEdge(1, range) : 0) {
 			range -= steps;
 			++res;
 		}
@@ -175,24 +165,96 @@ public:
 	}
 
 	template<typename ARRAY>
-	ARRAY readPattern(int range = 0)
+	ARRAY readPattern(int max = 0, int min = 0)
 	{
-		ARRAY res;
-		for (auto& i : res)
-			i = stepToEdge(1, range);
+		ARRAY res = {};
+		for (auto& i : res) {
+			i = stepToEdge(1, max);
+			if (!i)
+				return res;
+			if (max)
+				max -= i;
+		}
+		if (min && max) {
+			min -= Reduce(res);
+			if (min > 0)
+				res = {};
+			int steps = -1;
+			while (min > 0 && max && (steps = stepToEdge(2, max))) {
+				max -= steps;
+				min -= steps;
+			}
+		}
 		return res;
 	}
 
 	template<typename ARRAY>
-	ARRAY readPatternFromBlack(int maxWhitePrefix, int range = 0)
+	ARRAY readPatternFromBlack(int maxWhitePrefix, int max = 0, int min = 0)
 	{
 		if (maxWhitePrefix && isWhite() && !stepToEdge(1, maxWhitePrefix))
 			return {};
-		return readPattern<ARRAY>(range);
+		return readPattern<ARRAY>(max, min);
 	}
 };
 
 using BitMatrixCursorF = BitMatrixCursor<PointF>;
 using BitMatrixCursorI = BitMatrixCursor<PointI>;
+
+class FastEdgeToEdgeCounter
+{
+	const uint8_t* p = nullptr;
+	int stride = 0;
+	int stepsToBorder = 0;
+
+public:
+	FastEdgeToEdgeCounter(const BitMatrixCursorI& cur)
+	{
+		assert(cur.isIn());
+		stride = cur.d.y * cur.img->width() + cur.d.x;
+		p = cur.img->row(cur.p.y).begin() + cur.p.x;
+
+		int maxStepsX = cur.d.x ? (cur.d.x > 0 ? cur.img->width() - 1 - cur.p.x : cur.p.x) : INT_MAX;
+		int maxStepsY = cur.d.y ? (cur.d.y > 0 ? cur.img->height() - 1 - cur.p.y : cur.p.y) : INT_MAX;
+		stepsToBorder = std::min(maxStepsX, maxStepsY);
+	}
+
+	int stepToNextEdge(int range)
+	{
+		int maxSteps = std::min(stepsToBorder, range);
+		int steps = 0;
+
+		if (maxSteps < 0) // already outside the image
+			return 0;
+
+		// Move forward until we a) find a different pixel value or b) step outside the image or c) reach the range limit.
+		do {
+			if (++steps > maxSteps) {
+				if (maxSteps == stepsToBorder)
+					break;
+				else
+					return 0;
+			}
+		} while (p[steps * stride] == p[0]);
+
+		p += steps * stride;
+		stepsToBorder -= steps;
+
+		return steps;
+	}
+};
+
+// Generate points in a spiral pattern around the center
+inline std::generator<PointI> Spiral(int radius)
+{
+	co_yield{0, 0};
+	for (int r = 1; r <= radius; ++r) {
+		// clang-format off
+		for (int k = 0; k < 2 * r; ++k) co_yield{           r, -(r - 1) + k}; // right -> down
+		for (int k = 0; k < 2 * r; ++k)	co_yield{ (r - 1) - k,            r}; // bottom -> left
+		for (int k = 0; k < 2 * r; ++k)	co_yield{          -r,  (r - 1) - k}; // left -> up
+		for (int k = 0; k < 2 * r; ++k)	co_yield{-(r - 1) + k,           -r}; // top -> right
+		// clang-format on
+	}
+}
 
 } // ZXing

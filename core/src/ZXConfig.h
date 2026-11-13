@@ -1,35 +1,17 @@
-#pragma once
 /*
-* Copyright 2016 Nu-book Inc.
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
+* Copyright 2018 Axel Waggershauser
 */
+// SPDX-License-Identifier: Apache-2.0
 
-#define ZX_HAVE_CONFIG
+#pragma once
 
 // Thread local or static memory may be used to reduce the number of (re-)allocations of temporary variables
-// in e.g. the ReedSolomonDecoder. It is disabled by default. It can be enabled by modifying the following define.
-// Note: The Apple clang compiler until XCode 8 does not support c++11's thread_local.
-// The alternative 'static' makes the code thread unsafe.
-#define ZX_THREAD_LOCAL // 'thread_local' or 'static'
+// in e.g. the HistogramBinarizer. The default is thread_local, which is the best option for performance and safety in most cases. If
+// your platform doesn't support thread_local, you can switch to static, but be aware that this makes the code not thread safe.
+// For Windows in Visual Studio 2019 on Intel 64-bit using thread_local causes a dependency to VCRUNTIME140_1.dll, so you need 2019
+// runtime DLLs instead of only 2015 version.
+#define ZX_THREAD_LOCAL thread_local // '' (nothing), 'thread_local' or 'static'
 
-// The two basic data structures for storing bits (BitArray and BitMatrix) can be operated by storing one bit
-// of information either in one bit or one byte. Storing it in one byte is considerably faster, while obviously
-// using more memory. The effect of the memory usage while running the TestRunner is virtually invisible.
-// On embedded/mobile systems this might be of importance. Note: the BitMatrix in 'fast' mode still requires
-// only 1/3 of the same image in RGB.
-#define ZX_FAST_BIT_STORAGE // undef to disable
-
-// The Galoir Field abstractions used in Reed-Solomon error correction code can use more memory to eliminate a modulo
-// operation. This improves performance but might not be the best option if RAM is scarce. The effect is a few kB big.
-#define ZX_REED_SOLOMON_USE_MORE_MEMORY_FOR_SPEED
+// The Galois Field abstractions used in Reed-Solomon error correction code use more memory than required to improve performance (20% - 100%).
+// If RAM is scarce, you can define LIBRSCPP_SAVE_MEMORY to reduce memory usage. The effect is a few kB big.
+// #define LIBRSCPP_SAVE_MEMORY

@@ -1,25 +1,15 @@
 /*
 * Copyright 2017 Huy Cuong Nguyen
 * Copyright 2014 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "oned/ODCode128Writer.h"
 #include "BitMatrixIO.h"
-#include "DecodeHints.h"
-#include "Result.h"
+#include "ReaderOptions.h"
+#include "Barcode.h"
 #include "oned/ODCode128Reader.h"
+#include "ZXAlgorithms.h"
 
 #include "gtest/gtest.h"
 
@@ -46,17 +36,16 @@ static std::string LineMatrixToString(const BitMatrix& matrix)
 	return result.substr(0, result.size() - 1);
 }
 
-static ZXing::Result Decode(const BitMatrix &matrix)
+static ZXing::Barcode Decode(const BitMatrix &matrix)
 {
-	BitArray row;
-	matrix.getRow(0, row);
-	return Code128Reader(DecodeHints()).decodeSingleRow(0, row);
+	ReaderOptions opts;
+	return DecodeSingleRow(Code128Reader(opts), matrix.row(0));
 }
 
 TEST(ODCode128Writer, EncodeWithFunc1)
 {
-	auto toEncode = L"\xf1""123";
-    //                                                       "12"                           "3"          check digit 92
+	auto toEncode = L"\u00f1123";
+	//                                                       "12"                           "3"          check digit 92
 	auto expected = QUIET_SPACE + START_CODE_C + FNC1 + "10110011100" + SWITCH_CODE_B + "11001011100" + "10101111000" + STOP + QUIET_SPACE;
 
 	auto actual = LineMatrixToString(Code128Writer().encode(toEncode, 0, 0));
@@ -65,7 +54,7 @@ TEST(ODCode128Writer, EncodeWithFunc1)
 
 TEST(ODCode128Writer, EncodeWithFunc2)
 {
-	auto toEncode = L"\xf2""123";
+	auto toEncode = L"\u00f2123";
 	//                                                       "1"            "2"             "3"          check digit 56
 	auto expected = QUIET_SPACE + START_CODE_B + FNC2 + "10011100110" + "11001110010" + "11001011100" + "11100010110" + STOP + QUIET_SPACE;
 
@@ -75,7 +64,7 @@ TEST(ODCode128Writer, EncodeWithFunc2)
 
 TEST(ODCode128Writer, EncodeWithFunc3)
 {
-	auto toEncode = L"\xf3""123";
+	auto toEncode = L"\u00f3123";
 	//                                                       "1"            "2"             "3"          check digit 51
 	auto expected = QUIET_SPACE + START_CODE_B + FNC3 + "10011100110" + "11001110010" + "11001011100" + "11101000110" + STOP + QUIET_SPACE;
 
@@ -85,7 +74,7 @@ TEST(ODCode128Writer, EncodeWithFunc3)
 
 TEST(ODCode128Writer, EncodeWithFunc4)
 {
-	auto toEncode = L"\xf4""123";
+	auto toEncode = L"\u00f4123";
 	//                                                       "1"            "2"             "3"          check digit 59
 	auto expected = QUIET_SPACE + START_CODE_B + FNC4B + "10011100110" + "11001110010" + "11001011100" + "11100011010" + STOP + QUIET_SPACE;
 
@@ -95,26 +84,35 @@ TEST(ODCode128Writer, EncodeWithFunc4)
 
 TEST(ODCode128Writer, EncodeWithFncsAndNumberInCodesetA)
 {
-	auto toEncode = L"\n" "\xf1" "\xf4" "1" "\n";
+	auto toEncode = L"\n\u00f1\u00f41\n";
 	auto expected = QUIET_SPACE + START_CODE_A + LF + FNC1 + FNC4A + "10011100110" + LF + "10101111000" + STOP + QUIET_SPACE;
 	auto actual = LineMatrixToString(Code128Writer().encode(toEncode, 0, 0));
 	EXPECT_EQ(actual, expected);
 }
 
-TEST(ODCode128Writer, Roundtrip)
+TEST(ODCode128Writer, RoundtripGS1)
 {
-	auto toEncode = L"\xf1" "10958" "\xf1" "17160526";
-	auto expected = L"1095817160526";
+	auto toEncode = L"\u00f110958\u00f117160526";
 
-    auto encResult = Code128Writer().encode(toEncode, 0, 0);
-	auto actual = Decode(encResult).text();
-	EXPECT_EQ(actual, expected);
+	auto decResult = Decode(Code128Writer().encode(toEncode, 0, 0));
+	EXPECT_EQ(decResult.text(TextMode::HRI), "(10)958(17)160526");
+	EXPECT_EQ(decResult.symbologyIdentifier(), "]C1");
+}
+
+TEST(ODCode128Writer, RoundtripFNC1)
+{
+	auto toEncode = L"1\u00f10\u00f11";
+
+	auto encResult = Code128Writer().encode(toEncode, 0, 0);
+	auto decResult = Decode(encResult);
+	EXPECT_EQ(ToHex(decResult.bytes()), "31 1D 30 1D 31");
+	EXPECT_EQ(decResult.symbologyIdentifier(), "]C0");
 }
 
 TEST(ODCode128Writer, EncodeSwitchCodesetFromAToB)
 {
 	// start with A switch to B and back to A
-	auto toEncode = std::wstring(L"\0ABab\u0010", 6);
+	auto toEncode = std::string("\0ABab\u0010", 6);
 	//                                           "\0"            "A"             "B"             Switch to B     "a"             "b"             Switch to A     "\u0010"        check digit
 	auto expected = QUIET_SPACE + START_CODE_A + "10100001100" + "10100011000" + "10001011000" + SWITCH_CODE_B + "10010110000" + "10010000110" + SWITCH_CODE_A + "10100111100" + "11001110100" + STOP + QUIET_SPACE;
 
@@ -122,14 +120,14 @@ TEST(ODCode128Writer, EncodeSwitchCodesetFromAToB)
 	auto actual = LineMatrixToString(encoded);
 	EXPECT_EQ(actual, expected);
 
-	auto actualRoundTrip = Decode(encoded).text();
+	auto actualRoundTrip = Decode(encoded).text(TextMode::Plain);
 	EXPECT_EQ(actualRoundTrip, toEncode);
 }
 
 TEST(ODCode128Writer, EncodeSwitchCodesetFromBToA)
 {
 	// start with B switch to A and back to B
-	auto toEncode = std::wstring(L"ab\0ab", 5);
+	auto toEncode = std::string("ab\0ab", 5);
 	//                                           "a"             "b"             Switch to A     "\0             "Switch to B"   "a"             "b"             check digit
 	auto expected = QUIET_SPACE + START_CODE_B + "10010110000" + "10010000110" + SWITCH_CODE_A + "10100001100" + SWITCH_CODE_B + "10010110000" + "10010000110" + "11010001110" + STOP + QUIET_SPACE;
 
@@ -137,6 +135,6 @@ TEST(ODCode128Writer, EncodeSwitchCodesetFromBToA)
 	auto actual = LineMatrixToString(encoded);
 	EXPECT_EQ(actual, expected);
 
-	auto actualRoundTrip = Decode(encoded).text();
+	auto actualRoundTrip = Decode(encoded).text(TextMode::Plain);
 	EXPECT_EQ(actualRoundTrip, toEncode);
 }

@@ -1,27 +1,17 @@
-#pragma once
 /*
 * Copyright 2016 Nu-book Inc.
 * Copyright 2016 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 #include "DetectorResult.h"
 
+#include <optional>
 #include <utility>
 
-namespace ZXing {
-namespace Aztec {
+namespace ZXing::Aztec {
 
 class DetectorResult : public ZXing::DetectorResult
 {
@@ -29,25 +19,37 @@ class DetectorResult : public ZXing::DetectorResult
 	int _nbDatablocks = 0;
 	int _nbLayers = 0;
 	bool _readerInit = false;
-
-	DetectorResult(const DetectorResult&) = delete;
-	DetectorResult& operator=(const DetectorResult&) = delete;
+	bool _isMirrored = false;
+	int _runeValue = -1;
+	std::optional<double> _uec;
 
 public:
 	DetectorResult() = default;
-	DetectorResult(DetectorResult&&) = default;
-	DetectorResult& operator=(DetectorResult&&) = default;
+	DetectorResult(DetectorResult&&) noexcept = default;
+	DetectorResult& operator=(DetectorResult&&) noexcept = default;
+	DetectorResult(const DetectorResult&) = delete;
+	DetectorResult& operator=(const DetectorResult&) = delete;
 
-	DetectorResult(ZXing::DetectorResult&& result, bool isCompact, int nbDatablocks, int nbLayers, bool readerInit)
-		: ZXing::DetectorResult{std::move(result)}, _compact(isCompact), _nbDatablocks(nbDatablocks),
-		  _nbLayers(nbLayers), _readerInit(readerInit)
+	DetectorResult(ZXing::DetectorResult&& result, bool isCompact, int nbDatablocks, int nbLayers, bool readerInit, bool isMirrored, int runeValue, std::optional<double> uec)
+		: ZXing::DetectorResult{std::move(result)},
+		  _compact(isCompact),
+		  _nbDatablocks(nbDatablocks),
+		  _nbLayers(nbLayers),
+		  _readerInit(readerInit),
+		  _isMirrored(isMirrored),
+		  _runeValue(runeValue),
+		  _uec(uec)
 	{}
 
 	bool isCompact() const { return _compact; }
 	int nbDatablocks() const { return _nbDatablocks; }
 	int nbLayers() const { return _nbLayers; }
 	bool readerInit() const { return _readerInit; }
+	bool isMirrored() const { return _isMirrored; }
+	std::optional<double> uec() const { return _uec; }
+
+	// Only meaningful if nbDatablocks == 0
+	int runeValue() const { return _runeValue; }
 };
 
-} // Aztec
-} // ZXing
+} // namespace ZXing::Aztec

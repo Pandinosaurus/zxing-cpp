@@ -1,13 +1,22 @@
-cmake_minimum_required (VERSION 3.10)
+cmake_minimum_required(VERSION 3.21)
 
-project (ZXing VERSION "1.2.0" LANGUAGES CXX)
+project(ZXing)
 
-option (BUILD_WRITERS "Build with writer support (encoders)" ON)
-option (BUILD_READERS "Build with reader support (decoders)" ON)
-option (BUILD_EXAMPLES "Build the example barcode reader/writer applicatons" ON)
-option (BUILD_BLACKBOX_TESTS "Build the black box reader/writer tests" ON)
-option (BUILD_UNIT_TESTS "Build the unit tests (don't enable for production builds)" OFF)
-option (BUILD_PYTHON_MODULE "Build the python module" OFF)
+option (ZXING_READERS "Build with reader support (decoders)" ON)
+set    (ZXING_WRITERS "ON" CACHE STRING "Build with old and/or new writer (encoder) backend (OFF/ON/OLD/NEW/BOTH)")
+option (ZXING_C_API "Build the C-API" ON)
+option (ZXING_EXPERIMENTAL_API "Build with experimental API" OFF)
+option (ZXING_EXAMPLES "Build the example barcode reader/writer applications" ON)
+option (ZXING_EXAMPLES_QT "Build the Qt based example barcode reader/writer applications" OFF)
+option (ZXING_BLACKBOX_TESTS "Build the black box reader/writer tests" OFF)
+option (ZXING_UNIT_TESTS "Build the unit tests (don't enable for production builds)" OFF)
+option (ZXING_TEST_DOTNET "Test if the .NET wrapper works" OFF)
+option (ZXING_TEST_GO "Test if the Go wrapper works" OFF)
+option (ZXING_TEST_INSTALL "Test if the installed/public API works" OFF)
+option (ZXING_PYTHON_MODULE "Build the python module" OFF)
+set    (ZXING_DEPENDENCIES "AUTO" CACHE STRING "Fetch from github or use locally installed (AUTO/GITHUB/LOCAL)")
+option (ZXING_CLANG_TIDY "Enable clang-tidy analysis" OFF)
+option (ZXING_DOXYGEN "Enable doxygen documentation" OFF)
 
 if (WIN32)
     option (BUILD_SHARED_LIBS "Build and link as shared library" OFF)
@@ -16,17 +25,10 @@ else()
 endif()
 
 if (MSVC)
-    option (LINK_CPP_STATICALLY "MSVC only, link standard library statically (/MT and /MTd)" OFF)
-
-    add_definitions (-DUNICODE -D_UNICODE)
-    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
-    set (CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /Oi /GS-")
-    set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Oi /GS-")
-    if (LINK_CPP_STATICALLY)
-        set (CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /MT")
-        set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT")
-        set (CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /MTd")
-        set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd")
+    add_definitions (-DUNICODE -D_UNICODE -D_CRT_SECURE_NO_WARNINGS)
+    option (ZXING_LINK_CPP_STATICALLY "MSVC only, link standard library statically (/MT and /MTd)" OFF)
+    if (LINK_CPP_STATICALLY OR ZXING_LINK_CPP_STATICALLY)
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 endif()
 
@@ -37,90 +39,86 @@ if (NOT CMAKE_BUILD_TYPE)
     set_property (CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
-if (BUILD_SHARED_LIBS)
-    set (CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+if (NOT (ZXING_READERS OR ZXING_WRITERS))
+    message(FATAL_ERROR "At least one of ZXING_READERS/ZXING_WRITERS must be enabled.")
 endif()
 
-set (CMAKE_CXX_STANDARD 17)
-set (CMAKE_CXX_EXTENSIONS OFF)
+set(ZXING_WRITERS_LIST OFF ON OLD NEW BOTH)
+set_property(CACHE ZXING_WRITERS PROPERTY STRINGS ${ZXING_WRITERS_LIST})
+if(NOT ZXING_WRITERS IN_LIST ZXING_WRITERS_LIST)
+    message(FATAL_ERROR "ZXING_WRITERS must be one of ${ZXING_WRITERS_LIST}")
+endif()
 
-if (BUILD_UNIT_TESTS)
-    add_definitions (-DZXING_BUILD_FOR_TEST)
-    if (NOT BUILD_WRITERS OR NOT BUILD_READERS)
-        message("Note: To build with unit tests, the library will be build with READERS and WRITERS.")
-        set (BUILD_WRITERS ON)
-        set (BUILD_READERS ON)
+set(ZXING_DEPENDENCIES_LIST AUTO GITHUB LOCAL)
+set_property(CACHE ZXING_DEPENDENCIES PROPERTY STRINGS ${ZXING_DEPENDENCIES_LIST})
+if(NOT ZXING_DEPENDENCIES IN_LIST ZXING_DEPENDENCIES_LIST)
+    message(FATAL_ERROR "ZXING_DEPENDENCIES must be one of ${ZXING_DEPENDENCIES_LIST}")
+endif()
+
+if (NOT DEFINED CMAKE_CXX_STANDARD)
+    set (CMAKE_CXX_STANDARD 20)
+    set (CMAKE_CXX_STANDARD_REQUIRED ON)
+    set (CMAKE_CXX_EXTENSIONS OFF)
+endif()
+
+set(CMAKE_COLOR_DIAGNOSTICS ON)
+
+if (ZXING_CLANG_TIDY)
+    find_program(CMAKE_CXX_CLANG_TIDY NAMES "clang-tidy" DOC "Path to clang-tidy executable")
+    if (NOT CMAKE_CXX_CLANG_TIDY)
+        message(WARNING "clang-tidy not found.")
+    else()
+        message(STATUS "clang-tidy found: ${CMAKE_CXX_CLANG_TIDY}")
+        set(ZXING_DISABLE_PCH ON)
     endif()
 endif()
 
+# make installed binaries relocatable on macOS and Linux
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)  # improve build reproducibility
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH FALSE)
+set(CMAKE_INSTALL_RPATH "$<$<PLATFORM_ID:Darwin>:@loader_path/../lib>$<$<PLATFORM_ID:Linux>:$ORIGIN/../lib>")
+
 add_subdirectory (core)
+if (PROJECT_IS_TOP_LEVEL AND ZXING_DOXYGEN)
+    add_subdirectory (docs)
+endif()
 
 enable_testing()
 
-if (BUILD_EXAMPLES)
+include(zxing.cmake)
+
+if (ZXING_EXAMPLES)
     add_subdirectory (example)
 endif()
-if (BUILD_BLACKBOX_TESTS)
+if (ZXING_EXAMPLES_QT)
+    add_subdirectory (wrappers/qt)
+endif()
+if (ZXING_BLACKBOX_TESTS)
     add_subdirectory (test/blackbox)
 endif()
-if (BUILD_UNIT_TESTS)
+if (ZXING_UNIT_TESTS)
     add_subdirectory (test/unit)
 endif()
-if (BUILD_PYTHON_MODULE)
+if (ZXING_TEST_DOTNET)
+    add_subdirectory (wrappers/dotnet)
+endif()
+if (ZXING_TEST_GO)
+    add_subdirectory (wrappers/go)
+endif()
+if (ZXING_TEST_INSTALL)
+    add_test(
+        NAME InstallTest
+        COMMAND
+            ${CMAKE_COMMAND}
+            -DPROJECT_BINARY_DIR=${CMAKE_BINARY_DIR}
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/install
+            -DZXING_WRITERS=${ZXING_WRITERS}
+            -P ${CMAKE_SOURCE_DIR}/test/install/run.cmake
+    )
+endif()
+if (ZXING_PYTHON_MODULE)
     add_subdirectory (wrappers/python)
 endif()
-
-set (CMAKECONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/ZXing")
-
-install (
-    EXPORT ZXingTargets
-    DESTINATION ${CMAKECONFIG_INSTALL_DIR} NAMESPACE ZXing::
-)
-
-install (
-    DIRECTORY core/src/
-    DESTINATION include/ZXing
-    FILES_MATCHING PATTERN "*.h"
-)
-
-configure_file (
-    core/ZXVersion.h.in
-    ZXVersion.h
-)
-
-install (
-    FILES "${CMAKE_CURRENT_BINARY_DIR}/ZXVersion.h"
-    DESTINATION include/ZXing
-)
-
-# PC file generation.
-if (NOT DEFINED INSTALLDIR)
-    set (INSTALLDIR ${CMAKE_INSTALL_PREFIX})
-    get_filename_component(INSTALLDIR ${INSTALLDIR} ABSOLUTE)
+if (ZXING_C_API AND ZXING_EXAMPLES)
+    add_subdirectory (wrappers/c)
 endif()
-
-IF (NOT WIN32)
-    configure_file(zxing.pc.in zxing.pc @ONLY)
-    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/zxing.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
-ENDIF()
-
-include (CMakePackageConfigHelpers)
-
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/ZXingConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY AnyNewerVersion
-)
-
-configure_package_config_file (
-    core/ZXingConfig.cmake.in
-    ZXingConfig.cmake
-    INSTALL_DESTINATION ${CMAKECONFIG_INSTALL_DIR}
-)
-
-install (
-    FILES
-        "${CMAKE_CURRENT_BINARY_DIR}/ZXingConfig.cmake"
-        "${CMAKE_CURRENT_BINARY_DIR}/ZXingConfigVersion.cmake"
-    DESTINATION ${CMAKECONFIG_INSTALL_DIR}
-)

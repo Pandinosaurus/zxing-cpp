@@ -1,43 +1,39 @@
-cmake_minimum_required(VERSION 3.14)
+find_package(Threads REQUIRED)
 
-include(FetchContent)
-FetchContent_Declare (fmtlib
-        GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-        GIT_TAG 7.1.2)
-FetchContent_MakeAvailable (fmtlib) # Adds fmt::fmt
+zxing_add_package_stb()
+zxing_add_package(WebP WebP https://github.com/webmproject/libwebp.git v1.6.0)
 
-if (BUILD_READERS)
+if (ZXING_READERS)
     add_executable (ReaderTest
         TestReaderMain.cpp
         ImageLoader.h
         ImageLoader.cpp
         BlackboxTestRunner.h
         BlackboxTestRunner.cpp
-        ZXFilesystem.h
     )
 
-    target_include_directories (ReaderTest PRIVATE ../../thirdparty/stb)
-
     target_link_libraries(ReaderTest
-        ZXing::ZXing fmt::fmt
+        ZXing::ZXing stb::stb WebP::webp Threads::Threads
         $<$<AND:$<CXX_COMPILER_ID:GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,9.0>>:stdc++fs>
     )
 
-if (MSVC)
-    target_compile_options(ReaderTest PRIVATE
-        -D_CRT_SECURE_NO_WARNINGS
-    )
-endif()
+    if (WIN32)
+        add_custom_command(TARGET ReaderTest POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:ReaderTest>
+                $<TARGET_FILE_DIR:ReaderTest>
+            COMMAND_EXPAND_LISTS
+            VERBATIM
+        )
+    endif()
 
     add_test(NAME ReaderTest COMMAND ReaderTest ${CMAKE_CURRENT_SOURCE_DIR}/../samples)
 endif()
 
-if (BUILD_WRITERS)
+if (ZXING_WRITERS)
     add_executable (WriterTest TestWriterMain.cpp)
 
-    target_include_directories (WriterTest PRIVATE ../../thirdparty/stb)
-
-    target_link_libraries (WriterTest ZXing::ZXing)
+    target_link_libraries (WriterTest ZXing::ZXing stb::stb)
 
     add_test(NAME WriterTest COMMAND WriterTest)
 endif()

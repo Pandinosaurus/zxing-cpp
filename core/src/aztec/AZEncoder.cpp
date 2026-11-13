@@ -1,26 +1,14 @@
 /*
 * Copyright 2016 Huy Cuong Nguyen
 * Copyright 2016 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "AZEncoder.h"
 
 #include "AZHighLevelEncoder.h"
 #include "BitArray.h"
-#include "GenericGF.h"
-#include "ReedSolomonEncoder.h"
+#include "ReedSolomon.h"
 #include "ZXTestSupport.h"
 
 #include <cstdlib>
@@ -53,26 +41,14 @@ static void DrawBullsEye(BitMatrix& matrix, int center, int size)
 	matrix.set(center + size, center + size - 1);
 }
 
-static const GenericGF& GetGFFromWordSize(int wordSize)
-{
-	switch (wordSize) {
-	case 4:  return GenericGF::AztecParam();
-	case 6:  return GenericGF::AztecData6();
-	case 8:  return GenericGF::AztecData8();
-	case 10: return GenericGF::AztecData10();
-	case 12: return GenericGF::AztecData12();
-	default: throw std::invalid_argument("Unsupported word size " + std::to_string(wordSize));
-	}
-}
-
 static void GenerateCheckWords(const BitArray& bitArray, int totalBits, int wordSize, BitArray& messageBits)
 {
 	// bitArray is guaranteed to be a multiple of the wordSize, so no padding needed
 	std::vector<int> messageWords = ToInts(bitArray, wordSize, totalBits / wordSize);
-	ReedSolomonEncode(GetGFFromWordSize(wordSize), messageWords, (totalBits - bitArray.size()) / wordSize);
-	int startPad = totalBits % wordSize;
+	ReedSolomonEncode(GF2nAztec(wordSize), messageWords, (totalBits - bitArray.size()) / wordSize);
 	messageBits = BitArray();
-	messageBits.appendBits(0, startPad);
+	if (int startPad = totalBits % wordSize)
+		messageBits.appendBits(0, startPad);
 	for (int messageWord : messageWords)
 		messageBits.appendBits(messageWord, wordSize);
 }
@@ -91,6 +67,19 @@ void GenerateModeMessage(bool compact, int layers, int messageSizeInWords, BitAr
 		modeMessage.appendBits(messageSizeInWords - 1, 11);
 		GenerateCheckWords(modeMessage, 40, 4, modeMessage);
 	}
+}
+
+ZXING_EXPORT_TEST_ONLY
+void GenerateRuneMessage(uint8_t word, BitArray& runeMessage)
+{
+	runeMessage = BitArray();
+	runeMessage.appendBits(word, 8);
+	GenerateCheckWords(runeMessage, 28, 4, runeMessage);
+	// Now flip every other bit
+
+	BitArray xorBits;
+	xorBits.appendBits(0xAAAAAAAA, 28);
+	runeMessage.bitwiseXOR(xorBits);
 }
 
 static void DrawModeMessage(BitMatrix& matrix, bool compact, int matrixSize, const BitArray& modeMessage)
@@ -187,7 +176,13 @@ Encoder::Encode(const std::string& data, int minECCPercent, int userSpecifiedLay
 	int totalBitsInLayer;
 	int wordSize;
 	BitArray stuffedBits;
-	if (userSpecifiedLayers != DEFAULT_AZTEC_LAYERS) {
+	if (userSpecifiedLayers == AZTEC_RUNE_LAYERS) {
+		compact = true;
+		layers = 0;
+		totalBitsInLayer = 0;
+		wordSize = 0;
+		stuffedBits = BitArray(0);
+	} else if (userSpecifiedLayers != DEFAULT_AZTEC_LAYERS) {
 		compact = userSpecifiedLayers < 0;
 		layers = std::abs(userSpecifiedLayers);
 		if (layers > (compact ? MAX_NB_BITS_COMPACT : MAX_NB_BITS)) {
@@ -236,13 +231,21 @@ Encoder::Encode(const std::string& data, int minECCPercent, int userSpecifiedLay
 			}
 		}
 	}
-	BitArray messageBits;
-	GenerateCheckWords(stuffedBits, totalBitsInLayer, wordSize, messageBits);
 
-	// generate mode message
-	int messageSizeInWords = stuffedBits.size() / wordSize;
+	BitArray messageBits;
 	BitArray modeMessage;
-	GenerateModeMessage(compact, layers, messageSizeInWords, modeMessage);
+	int messageSizeInWords;
+
+	if (layers == 0) {
+		// This is a rune, and messageBits should be empty
+		messageBits = BitArray(0);
+		messageSizeInWords = 0;
+		GenerateRuneMessage(data[0], modeMessage);
+	} else {
+		GenerateCheckWords(stuffedBits, totalBitsInLayer, wordSize, messageBits);
+		messageSizeInWords = stuffedBits.size() / wordSize;
+		GenerateModeMessage(compact, layers, messageSizeInWords, modeMessage);
+	}
 
 	// allocate symbol
 	int baseMatrixSize = (compact ? 11 : 14) + layers * 4; // not including alignment lines

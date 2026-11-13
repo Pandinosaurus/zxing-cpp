@@ -1,3 +1,8 @@
+/*
+ * Copyright 2021 Axel Waggershauser
+ */
+// SPDX-License-Identifier: Apache-2.0
+
 #include <stdint.h>
 #include <stddef.h>
 
@@ -9,7 +14,7 @@ using namespace ZXing::DataMatrix;
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
-    std::wstring txt(data, data + size);
+	std::wstring txt(data, data + size);
 	try {
 		Encode(txt);
 	} catch (...) {

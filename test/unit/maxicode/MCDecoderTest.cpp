@@ -1,18 +1,7 @@
 /*
 * Copyright 2021 gitlost
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "ByteArray.h"
 #include "DecoderResult.h"
@@ -22,7 +11,7 @@
 
 namespace ZXing::MaxiCode::DecodedBitStreamParser {
 
-DecoderResult Decode(ByteArray&& bytes, const int mode, const std::string& characterSet);
+DecoderResult Decode(ByteArray&& bytes, int mode);
 
 }
 
@@ -37,52 +26,65 @@ static void pad(ByteArray& padded)
 }
 
 // Helper to call Decode()
-static DecoderResult parse(ByteArray bytes, const int mode)
+static DecoderResult parse(ByteArray bytes, const int mode, ByteArray *mode2or3 = nullptr)
 {
 	ByteArray padded;
 	padded.reserve(93 + 1); // 93 + mode
 	if (mode == 2) {
-		// Mode 2, Postcode 152382802, Country 840, Class 001 example from ISO/IEC 16023:2000 Annex B.2
-		padded = {34, 20, 45, 20, 17, 18, 2, 18, 7, 0};
+		if (mode2or3) {
+			padded = *mode2or3;
+		} else {
+			// Mode 2, Postcode 152382802, Country 840, Class 001 example from ISO/IEC 16023:2000 Annex B.2
+			padded = {34, 20, 45, 20, 17, 18, 2, 18, 7, 0};
+		}
 	} else if (mode == 3) {
-		// Mode 3, Postcode B1050, Country 056, Class 999 example from ISO/IEC 16023:2000 Annex B.1
-		padded = {3, 8, 28, 13, 28, 44, 0, 14, 28, 62};
+		if (mode2or3) {
+			padded = *mode2or3;
+		} else {
+			// Mode 3, Postcode B1050, Country 056, Class 999 example from ISO/IEC 16023:2000 Annex B.1
+			padded = {3, 8, 28, 13, 28, 44, 0, 14, 28, 62};
+		}
 	} else {
 		padded.push_back(mode);
 	}
 	padded.insert(padded.end(), bytes.begin(), bytes.end());
 	pad(padded);
-	return MaxiCode::DecodedBitStreamParser::Decode(std::move(padded), mode, "");
+	return MaxiCode::DecodedBitStreamParser::Decode(std::move(padded), mode);
 }
 
 // Helper to return Structured Append
 static StructuredAppendInfo info(ByteArray bytes, const int mode)
 {
-	return parse(bytes, mode).structuredAppend();
+	return parse(std::move(bytes), mode).structuredAppend();
 }
 
-TEST(MCDecodeTest, StructuredAppend)
+TEST(MCDecoderTest, StructuredAppendSymbologyIdentifier)
 {
 	// Null
 	EXPECT_EQ(info({49}, 2).index, -1); // Mode 2
 	EXPECT_EQ(info({49}, 2).count, -1);
 	EXPECT_TRUE(info({49}, 2).id.empty());
+	EXPECT_EQ(parse({49}, 2).symbologyIdentifier(), "]U1");
 
 	EXPECT_EQ(info({49}, 3).index, -1); // Mode 3
 	EXPECT_EQ(info({49}, 3).count, -1);
 	EXPECT_TRUE(info({49}, 3).id.empty());
+	EXPECT_EQ(parse({49}, 3).symbologyIdentifier(), "]U1");
 
 	EXPECT_EQ(info({49}, 4).index, -1); // Mode 4
 	EXPECT_EQ(info({49}, 4).count, -1);
 	EXPECT_TRUE(info({49}, 4).id.empty());
+	EXPECT_EQ(parse({49}, 4).symbologyIdentifier(), "]U0");
 
 	EXPECT_EQ(info({49}, 5).index, -1); // Mode 5
 	EXPECT_EQ(info({49}, 5).count, -1);
 	EXPECT_TRUE(info({49}, 5).id.empty());
+	EXPECT_EQ(parse({49}, 5).symbologyIdentifier(), "]U0");
 
 	EXPECT_EQ(info({49}, 6).index, -1); // Mode 6
 	EXPECT_EQ(info({49}, 6).count, -1);
 	EXPECT_TRUE(info({49}, 6).id.empty());
+//	EXPECT_TRUE(parse({49}, 6).symbologyIdentifier().empty()); // Not defined for reader initialisation/programming
 
 	// ISO/IEC 16023:2000 4.9.1 example
 	EXPECT_EQ(info({33, 22, 49}, 2).index, 2); // Mode 2 - 3rd position 1-based == index 2
@@ -143,7 +145,7 @@ TEST(MCDecodeTest, StructuredAppend)
 	EXPECT_EQ(info({33, 032, 49}, 4).count, 0);
 }
 
-TEST(MCDecodeTest, ReaderInit)
+TEST(MCDecoderTest, ReaderInit)
 {
 	// Null
 	EXPECT_FALSE(parse({49}, 2).readerInit()); // Mode 2
@@ -152,4 +154,71 @@ TEST(MCDecodeTest, ReaderInit)
 	// Set
 	EXPECT_TRUE(parse({49}, 6).readerInit()); // Mode 6
 	EXPECT_TRUE(parse({49}, 6).isValid());
+}
+
+TEST(MCDecoderTest, Mode2)
+{
+	// Good data
+	{
+		// Postcode 1234, Postcode Length 4, Country 999, Class 999
+		ByteArray mode2 = { 34, 52, 4, 0, 0, 0, 49, 57, 31, 62 };
+		EXPECT_EQ(parse({49}, 2, &mode2).content().utf8(), "1234\035999\035999\0351");
+	}
+	{
+		// Postcode 0123, Postcode Length 4, Country 999, Class 999
+		ByteArray mode2 = { 50, 30, 0, 0, 0, 0, 49, 57, 31, 62 };
+		EXPECT_EQ(parse({49}, 2, &mode2).content().utf8(), "0123\035999\035999\0351");
+	}
+
+	// Dodgy data (postcode length mismatch)
+	{
+		// Postcode 123456789, Postcode Length 4, Country 999, Class 999
+		ByteArray mode2 = { 18, 5, 13, 47, 53, 1, 49, 57, 31, 62 };
+		EXPECT_EQ(parse({49}, 2, &mode2).content().utf8(), "1234\035999\035999\0351"); // Postcode truncated
+	}
+	{
+		// Postcode 123, Postcode Length 4, Country 999, Class 999
+		ByteArray mode2 = { 50, 30, 0, 0, 0, 0, 49, 57, 31, 62 };
+		EXPECT_EQ(parse({49}, 2, &mode2).content().utf8(), "0123\035999\035999\0351"); // Postcode zero-filled to len 4
+	}
+
+	// Out-of-range data
+	{
+		// Postcode 1, Postcode Length 10, Country 999, Class 999
+		ByteArray mode2 = { 18, 0, 0, 0, 0, 32, 50, 57, 31, 62 };
+		EXPECT_EQ(parse({49}, 2, &mode2).content().utf8(), "000000001\035999\035999\0351"); // Postcode capped to len 9 & zero-filled
+	}
+	{
+		// Postcode 1073741823 (0x3FFFFFFF, 30-bit max), Postcode Length 10, Country 999, Class 999
+		ByteArray mode2 = { 50, 63, 63, 63, 63, 47, 50, 57, 31, 62 };
+		EXPECT_EQ(parse({49}, 2, &mode2).content().utf8(), "107374182\035999\035999\0351"); // Postcode truncated
+	}
+	{
+		// Postcode 12345, Postcode Length 5, Country 1023 (0x3FF, 10-bit max), Class 999
+		ByteArray mode2 = { 18, 14, 48, 0, 0, 16, 49, 63, 31, 62 };
+		EXPECT_EQ(parse({49}, 2, &mode2).content().utf8(), "12345\035999\035999\0351"); // Country capped to 999
+	}
+	{
+		// Postcode 123456, Postcode Length 8, Country 999, Class 1000 (0x3E8)
+		ByteArray mode2 = { 2, 16, 34, 7, 0, 0, 50, 57, 35, 62 };
+		EXPECT_EQ(parse({49}, 2, &mode2).content().utf8(), "00123456\035999\035999\0351"); // Class capped to 999
+	}
+}
+
+// Security regression test: the NS (Numeric Set) escape used to read 5 codewords past the end of the
+// data array when it appeared as the very last codeword, causing a heap out-of-bounds read.
+TEST(MCDecoderTest, TruncatedNumericSetEscape)
+{
+	ByteArray bytes(93); // zero-filled filler codewords ('\r' in charset A)
+	bytes.back() = 31;   // NS escape as the very last codeword, with no data following it
+	EXPECT_EQ(parse(bytes, 4).error(), Error::Format);
+}
+
+// Security regression test: the ECI escape used to read 1-4 codewords past the end of the data array
+// when it appeared as the very last codeword, causing a heap out-of-bounds read.
+TEST(MCDecoderTest, TruncatedECIEscape)
+{
+	ByteArray bytes(93);
+	bytes.back() = 27; // ECI escape as the very last codeword, with no data following it
+	EXPECT_EQ(parse(bytes, 4).error(), Error::Format);
 }

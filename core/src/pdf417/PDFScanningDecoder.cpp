@@ -1,46 +1,29 @@
 /*
 * Copyright 2016 Nu-book Inc.
 * Copyright 2016 ZXing authors
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PDFScanningDecoder.h"
-#include "PDFBoundingBox.h"
-#include "PDFDetectionResultColumn.h"
-#include "PDFCodewordDecoder.h"
-#include "PDFBarcodeMetadata.h"
-#include "PDFDetectionResult.h"
-#include "PDFBarcodeValue.h"
-#include "PDFDecodedBitStreamParser.h"
-#include "PDFModulusGF.h"
-#include "ResultPoint.h"
-#include "ZXNullable.h"
-#include "BitMatrix.h"
-#include "DecodeStatus.h"
-#include "DecoderResult.h"
-#include "ZXTestSupport.h"
 
-#include <cstdlib>
-#include <array>
-#include <algorithm>
+#include "Barcode.h"
+#include "BitMatrix.h"
+#include "DecoderResult.h"
+#include "PDFBarcodeMetadata.h"
+#include "PDFBarcodeValue.h"
+#include "PDFCodewordDecoder.h"
+#include "PDFDetectionResult.h"
+#include "PDFDecoder.h"
+#include "PDFCustomData.h"
+#include "ReedSolomon.h"
+#include "ZXAlgorithms.h"
+
+#include <cmath>
 
 namespace ZXing {
 namespace Pdf417 {
 
 static const int CODEWORD_SKEW_SIZE = 2;
-static const int MAX_ERRORS = 3;
-static const int MAX_EC_CODEWORDS = 512;
 
 using ModuleBitCountType = std::array<int, CodewordDecoder::BARS_IN_MODULE>;
 
@@ -50,7 +33,7 @@ static int AdjustCodewordStartColumn(const BitMatrix& image, int minColumn, int 
 	int increment = leftToRight ? -1 : 1;
 	// there should be no black pixels before the start column. If there are, then we need to start earlier.
 	for (int i = 0; i < 2; i++) {
-		while ((leftToRight ? correctedStartColumn >= minColumn : correctedStartColumn < maxColumn) &&
+		while (correctedStartColumn >= minColumn && correctedStartColumn < maxColumn &&
 			leftToRight == image.get(correctedStartColumn, imageRow)) {
 			if (std::abs(codewordStartColumn - correctedStartColumn) > CODEWORD_SKEW_SIZE) {
 				return codewordStartColumn;
@@ -70,7 +53,7 @@ static bool GetModuleBitCount(const BitMatrix& image, int minColumn, int maxColu
 	int increment = leftToRight ? 1 : -1;
 	bool previousPixelValue = leftToRight;
 	std::fill(moduleBitCount.begin(), moduleBitCount.end(), 0);
-	while ((leftToRight ? (imageColumn < maxColumn) : (imageColumn >= minColumn)) && moduleNumber < moduleBitCount.size()) {
+	while (imageColumn >= minColumn && imageColumn < maxColumn && moduleNumber < moduleBitCount.size()) {
 		if (image.get(imageColumn, imageRow) == previousPixelValue) {
 			moduleBitCount[moduleNumber] += 1;
 			imageColumn += increment;
@@ -92,8 +75,8 @@ static bool CheckCodewordSkew(int codewordSize, int minCodewordWidth, int maxCod
 
 static ModuleBitCountType GetBitCountForCodeword(int codeword)
 {
-    ModuleBitCountType result;
-    result.fill(0);
+	ModuleBitCountType result;
+	result.fill(0);
 	int previousValue = 0;
 	int i = Size(result) - 1;
 	while (true) {
@@ -143,7 +126,7 @@ static Nullable<Codeword> DetectCodeword(const BitMatrix& image, int minColumn, 
 	}
 	// TODO implement check for width and correction of black and white bars
 	// use start (and maybe stop pattern) to determine if blackbars are wider than white bars. If so, adjust.
-	// should probably done only for codewords with a lot more than 17 bits. 
+	// should probably done only for codewords with a lot more than 17 bits.
 	// The following fixes 10-1.png, which has wide black bars and small white bars
 	//    for (int i = 0; i < moduleBitCount.length; i++) {
 	//      if (i % 2 == 0) {
@@ -357,198 +340,18 @@ static bool AdjustCodewordCount(const DetectionResult& detectionResult, std::vec
 {
 	auto numberOfCodewords = barcodeMatrix[0][1].value();
 	int calculatedNumberOfCodewords = detectionResult.barcodeColumnCount() * detectionResult.barcodeRowCount() - GetNumberOfECCodeWords(detectionResult.barcodeECLevel());
+	if (calculatedNumberOfCodewords < 1 || calculatedNumberOfCodewords > CodewordDecoder::MAX_CODEWORDS_IN_BARCODE)
+		calculatedNumberOfCodewords = 0;
 	if (numberOfCodewords.empty()) {
-		if (calculatedNumberOfCodewords < 1 || calculatedNumberOfCodewords > CodewordDecoder::MAX_CODEWORDS_IN_BARCODE) {
+		if (!calculatedNumberOfCodewords)
 			return false;
-		}
 		barcodeMatrix[0][1].setValue(calculatedNumberOfCodewords);
 	}
-	else if (numberOfCodewords[0] != calculatedNumberOfCodewords) {
+	else if (calculatedNumberOfCodewords && numberOfCodewords[0] != calculatedNumberOfCodewords) {
 		// The calculated one is more reliable as it is derived from the row indicator columns
 		barcodeMatrix[0][1].setValue(calculatedNumberOfCodewords);
 	}
 	return true;
-}
-// +++++++++++++++++++++++++++++++++++ Error Correction
-
-static const ModulusGF& GetModulusGF()
-{
-	static const ModulusGF field(CodewordDecoder::NUMBER_OF_CODEWORDS, 3);
-	return field;
-}
-
-static bool RunEuclideanAlgorithm(ModulusPoly a, ModulusPoly b, int R, ModulusPoly& sigma, ModulusPoly& omega)
-{
-	const ModulusGF& field = GetModulusGF();
-
-	// Assume a's degree is >= b's
-	if (a.degree() < b.degree()) {
-		swap(a, b);
-	}
-
-	ModulusPoly rLast = a;
-	ModulusPoly r = b;
-	ModulusPoly tLast = field.zero();
-	ModulusPoly t = field.one();
-
-	// Run Euclidean algorithm until r's degree is less than R/2
-	while (r.degree() >= R / 2) {
-		ModulusPoly rLastLast = rLast;
-		ModulusPoly tLastLast = tLast;
-		rLast = r;
-		tLast = t;
-
-		// Divide rLastLast by rLast, with quotient in q and remainder in r
-		if (rLast.isZero()) {
-			// Oops, Euclidean algorithm already terminated?
-			return false;
-		}
-		r = rLastLast;
-		ModulusPoly q = field.zero();
-		int denominatorLeadingTerm = rLast.coefficient(rLast.degree());
-		int dltInverse = field.inverse(denominatorLeadingTerm);
-		while (r.degree() >= rLast.degree() && !r.isZero()) {
-			int degreeDiff = r.degree() - rLast.degree();
-			int scale = field.multiply(r.coefficient(r.degree()), dltInverse);
-			q = q.add(field.buildMonomial(degreeDiff, scale));
-			r = r.subtract(rLast.multiplyByMonomial(degreeDiff, scale));
-		}
-
-		t = q.multiply(tLast).subtract(tLastLast).negative();
-	}
-
-	int sigmaTildeAtZero = t.coefficient(0);
-	if (sigmaTildeAtZero == 0) {
-		return false;
-	}
-
-	int inverse = field.inverse(sigmaTildeAtZero);
-	sigma = t.multiply(inverse);
-	omega = r.multiply(inverse);
-	return true;
-}
-
-static bool FindErrorLocations(const ModulusPoly& errorLocator, std::vector<int>& result)
-{
-	const ModulusGF& field = GetModulusGF();
-	// This is a direct application of Chien's search
-	int numErrors = errorLocator.degree();
-	result.resize(numErrors);
-	int e = 0;
-	for (int i = 1; i < field.size() && e < numErrors; i++) {
-		if (errorLocator.evaluateAt(i) == 0) {
-			result[e] = field.inverse(i);
-			e++;
-		}
-	}
-	return e == numErrors;
-}
-
-static std::vector<int> FindErrorMagnitudes(const ModulusPoly& errorEvaluator, const ModulusPoly& errorLocator, const std::vector<int>& errorLocations)
-{
-	const ModulusGF& field = GetModulusGF();
-	int errorLocatorDegree = errorLocator.degree();
-	std::vector<int> formalDerivativeCoefficients(errorLocatorDegree);
-	for (int i = 1; i <= errorLocatorDegree; i++) {
-		formalDerivativeCoefficients[errorLocatorDegree - i] = field.multiply(i, errorLocator.coefficient(i));
-	}
-
-	ModulusPoly formalDerivative(field, formalDerivativeCoefficients);
-	// This is directly applying Forney's Formula
-	std::vector<int> result(errorLocations.size());
-	for (size_t i = 0; i < result.size(); i++) {
-		int xiInverse = field.inverse(errorLocations[i]);
-		int numerator = field.subtract(0, errorEvaluator.evaluateAt(xiInverse));
-		int denominator = field.inverse(formalDerivative.evaluateAt(xiInverse));
-		result[i] = field.multiply(numerator, denominator);
-	}
-	return result;
-}
-
-/**
-* @param received received codewords
-* @param numECCodewords number of those codewords used for EC
-* @param erasures location of erasures
-* @return number of errors
-* @throws ChecksumException if errors cannot be corrected, maybe because of too many errors
-*/
-ZXING_EXPORT_TEST_ONLY
-bool DecodeErrorCorrection(std::vector<int>& received, int numECCodewords, const std::vector<int>& erasures, int& nbErrors)
-{
-	const ModulusGF& field = GetModulusGF();
-	ModulusPoly poly(field, received);
-	std::vector<int> S(numECCodewords);
-	bool error = false;
-	for (int i = numECCodewords; i > 0; i--) {
-		int eval = poly.evaluateAt(field.exp(i));
-		S[numECCodewords - i] = eval;
-		if (eval != 0) {
-			error = true;
-		}
-	}
-
-	if (!error) {
-		nbErrors = 0;
-		return true;
-	}
-
-	ModulusPoly knownErrors = field.one();
-	for (int erasure : erasures) {
-		int b = field.exp(Size(received) - 1 - erasure);
-		// Add (1 - bx) term:
-		ModulusPoly term(field, { field.subtract(0, b), 1 });
-		knownErrors = knownErrors.multiply(term);
-	}
-
-	ModulusPoly syndrome(field, S);
-	//syndrome = syndrome.multiply(knownErrors);
-
-	ModulusPoly sigma, omega;
-	if (!RunEuclideanAlgorithm(field.buildMonomial(numECCodewords, 1), syndrome, numECCodewords, sigma, omega)) {
-		return false;
-	}
-
-	//sigma = sigma.multiply(knownErrors);
-
-	std::vector<int> errorLocations;
-	if (!FindErrorLocations(sigma, errorLocations)) {
-		return false;
-	}
-
-	std::vector<int> errorMagnitudes = FindErrorMagnitudes(omega, sigma, errorLocations);
-
-	int receivedSize = Size(received);
-	for (size_t i = 0; i < errorLocations.size(); i++) {
-		int position = receivedSize - 1 - field.log(errorLocations[i]);
-		if (position < 0) {
-			return false;
-		}
-		received[position] = field.subtract(received[position], errorMagnitudes[i]);
-	}
-	nbErrors = Size(errorLocations);
-	return true;
-}
-
-// --------------------------------------- Error Correction
-
-/**
-* <p>Given data and error-correction codewords received, possibly corrupted by errors, attempts to
-* correct the errors in-place.</p>
-*
-* @param codewords   data and error correction codewords
-* @param erasures positions of any known erasures
-* @param numECCodewords number of error correction codewords that are available in codewords
-* @throws ChecksumException if error correction fails
-*/
-static bool CorrectErrors(std::vector<int>& codewords, const std::vector<int>& erasures, int numECCodewords, int& errorCount)
-{
-	if (Size(erasures) > numECCodewords / 2 + MAX_ERRORS ||
-		numECCodewords < 0 ||
-		numECCodewords > MAX_EC_CODEWORDS) {
-		// Too many errors or EC Codewords is corrupted
-		return false;
-	}
-	return DecodeErrorCorrection(codewords, numECCodewords, erasures, errorCount);
 }
 
 /**
@@ -568,8 +371,10 @@ static bool VerifyCodewordCount(std::vector<int>& codewords, int numECCodewords)
 	if (numberOfCodewords > Size(codewords)) {
 		return false;
 	}
-	if (numberOfCodewords == 0) {
-		// Reset to the length of the array - 8 (Allow for at least level 3 Error Correction (8 Error Codewords)
+
+	assert(numECCodewords >= 2);
+	if (numberOfCodewords + numECCodewords != Size(codewords)) {
+		// Reset to the length of the array less number of Error Codewords
 		if (numECCodewords < Size(codewords)) {
 			codewords[0] = Size(codewords) - numECCodewords;
 		}
@@ -580,30 +385,21 @@ static bool VerifyCodewordCount(std::vector<int>& codewords, int numECCodewords)
 	return true;
 }
 
-DecoderResult DecodeCodewords(std::vector<int>& codewords, int ecLevel, const std::vector<int>& erasures,
-							  const std::string& characterSet)
+DecoderResult DecodeCodewords(std::vector<int>& codewords, int numECCodewords, std::span<const int> erasures, bool microPDF417)
 {
-	if (codewords.empty()) {
-		return DecodeStatus::FormatError;
-	}
+	if (codewords.empty())
+		return FormatError();
 
-	int numECCodewords = 1 << (ecLevel + 1);
-	int correctedErrorsCount = 0;
-	if (!CorrectErrors(codewords, erasures, numECCodewords, correctedErrorsCount))
-		return DecodeStatus::ChecksumError;
+	auto res = ReedSolomonDecode(RSField::PDF417, codewords, numECCodewords, erasures);
+	if (!res)
+		return ChecksumError();
 
 	if (!VerifyCodewordCount(codewords, numECCodewords))
-		return DecodeStatus::FormatError;
+		return FormatError();
 
 	// Decode the codewords
-	auto result = DecodedBitStreamParser::Decode(codewords, ecLevel, characterSet);
-	if (result.isValid()) {
-		result.setErrorsCorrected(correctedErrorsCount);
-		result.setErasures(Size(erasures));
-	}
-	return result;
+	return Decode(codewords, microPDF417).setEcLevel(std::to_string(numECCodewords * 100 / Size(codewords)) + "%").addExtra(BarcodeExtra::UEC, *res, -1.0);
 }
-
 
 /**
 * This method deals with the fact, that the decoding process doesn't always yield a single most likely value. The
@@ -620,7 +416,7 @@ DecoderResult DecodeCodewords(std::vector<int>& codewords, int ecLevel, const st
 */
 static DecoderResult CreateDecoderResultFromAmbiguousValues(int ecLevel, std::vector<int>& codewords,
 	const std::vector<int>& erasureArray, const std::vector<int>& ambiguousIndexes,
-	const std::vector<std::vector<int>>& ambiguousIndexValues, const std::string& characterSet)
+	const std::vector<std::vector<int>>& ambiguousIndexValues)
 {
 	std::vector<int> ambiguousIndexCount(ambiguousIndexes.size(), 0);
 
@@ -629,13 +425,13 @@ static DecoderResult CreateDecoderResultFromAmbiguousValues(int ecLevel, std::ve
 		for (size_t i = 0; i < ambiguousIndexCount.size(); i++) {
 			codewords[ambiguousIndexes[i]] = ambiguousIndexValues[i][ambiguousIndexCount[i]];
 		}
-		auto result = DecodeCodewords(codewords, ecLevel, erasureArray, characterSet);
-		if (result.errorCode() != DecodeStatus::ChecksumError) {
+		auto result = DecodeCodewords(codewords, NumECCodeWords(ecLevel), erasureArray);
+		if (result.error() != Error::Checksum) {
 			return result;
 		}
 
 		if (ambiguousIndexCount.empty()) {
-			return DecodeStatus::ChecksumError;
+			return ChecksumError();
 		}
 		for (size_t i = 0; i < ambiguousIndexCount.size(); i++) {
 			if (ambiguousIndexCount[i] < Size(ambiguousIndexValues[i]) - 1) {
@@ -645,20 +441,20 @@ static DecoderResult CreateDecoderResultFromAmbiguousValues(int ecLevel, std::ve
 			else {
 				ambiguousIndexCount[i] = 0;
 				if (i == ambiguousIndexCount.size() - 1) {
-					return DecodeStatus::ChecksumError;
+					return ChecksumError();
 				}
 			}
 		}
 	}
-	return DecodeStatus::ChecksumError;
+	return ChecksumError();
 }
 
 
-static DecoderResult CreateDecoderResult(DetectionResult& detectionResult, const std::string& characterSet)
+static DecoderResult CreateDecoderResult(DetectionResult& detectionResult)
 {
 	auto barcodeMatrix = CreateBarcodeMatrix(detectionResult);
 	if (!AdjustCodewordCount(detectionResult, barcodeMatrix)) {
-		return DecodeStatus::NotFound;
+		return {};
 	}
 	std::vector<int> erasures;
 	std::vector<int> codewords(detectionResult.barcodeRowCount() * detectionResult.barcodeColumnCount(), 0);
@@ -681,24 +477,24 @@ static DecoderResult CreateDecoderResult(DetectionResult& detectionResult, const
 		}
 	}
 	return CreateDecoderResultFromAmbiguousValues(detectionResult.barcodeECLevel(), codewords, erasures,
-												  ambiguousIndexesList, ambiguousIndexValues, characterSet);
+												  ambiguousIndexesList, ambiguousIndexValues);
 }
 
 
 // TODO don't pass in minCodewordWidth and maxCodewordWidth, pass in barcode columns for start and stop pattern
 // columns. That way width can be deducted from the pattern column.
-// This approach also allows to detect more details about the barcode, e.g. if a bar type (white or black) is wider 
+// This approach also allows detecting more details about the barcode, e.g. if a bar type (white or black) is wider
 // than it should be. This can happen if the scanner used a bad blackpoint.
 DecoderResult
 ScanningDecoder::Decode(const BitMatrix& image, const Nullable<ResultPoint>& imageTopLeft, const Nullable<ResultPoint>& imageBottomLeft,
 	const Nullable<ResultPoint>& imageTopRight, const Nullable<ResultPoint>& imageBottomRight,
-	int minCodewordWidth, int maxCodewordWidth, const std::string& characterSet)
+	int minCodewordWidth, int maxCodewordWidth)
 {
 	BoundingBox boundingBox;
 	if (!BoundingBox::Create(image.width(), image.height(), imageTopLeft, imageBottomLeft, imageTopRight, imageBottomRight, boundingBox)) {
-		return DecodeStatus::NotFound;
+		return {};
 	}
-	
+
 	Nullable<DetectionResultColumn> leftRowIndicatorColumn, rightRowIndicatorColumn;
 	DetectionResult detectionResult;
 	for (int i = 0; i < 2; i++) {
@@ -709,7 +505,7 @@ ScanningDecoder::Decode(const BitMatrix& image, const Nullable<ResultPoint>& ima
 			rightRowIndicatorColumn = GetRowIndicatorColumn(image, boundingBox, imageTopRight, false, minCodewordWidth, maxCodewordWidth);
 		}
 		if (!Merge(leftRowIndicatorColumn, rightRowIndicatorColumn, detectionResult)) {
-			return DecodeStatus::NotFound;
+			return {};
 		}
 		if (i == 0 && detectionResult.getBoundingBox() != nullptr && (detectionResult.getBoundingBox().value().minY() < boundingBox.minY() || detectionResult.getBoundingBox().value().maxY() > boundingBox.maxY())) {
 			boundingBox = detectionResult.getBoundingBox();
@@ -748,12 +544,15 @@ ScanningDecoder::Decode(const BitMatrix& image, const Nullable<ResultPoint>& ima
 			if (codeword != nullptr) {
 				detectionResult.column(barcodeColumn).value().setCodeword(imageRow, codeword);
 				previousStartColumn = startColumn;
-				minCodewordWidth = std::min(minCodewordWidth, codeword.value().width());
-				maxCodewordWidth = std::max(maxCodewordWidth, codeword.value().width());
+				UpdateMinMax(minCodewordWidth, maxCodewordWidth, codeword.value().width());
 			}
 		}
 	}
-	return CreateDecoderResult(detectionResult, characterSet);
+	auto res = CreateDecoderResult(detectionResult);
+	auto customData = std::static_pointer_cast<PDF417CustomData>(res.customData());
+	if (customData)
+		customData->approxSymbolWidth = (detectionResult.barcodeColumnCount() + 2) * (minCodewordWidth + maxCodewordWidth) / 2;
+	return res;
 }
 
 } // Pdf417

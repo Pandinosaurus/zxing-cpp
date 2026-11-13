@@ -1,25 +1,18 @@
-#pragma once
 /*
 * Copyright 2020 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 #include "ODRowReader.h"
+#include "Log.h"
+#include "Range.h"
 #include "Pattern.h"
-#include "Result.h"
 
 #include <array>
+#include <cmath>
+#include <numeric>
 
 namespace ZXing::OneD::DataBar {
 
@@ -42,8 +35,8 @@ inline bool IsFinder(int a, int b, int c, int d, int e)
 //			 (c < 5 + 10 * e) &&
 			 (a < 2 + 4 * e) &&
 			 (4 * a > n);
-#if !defined(NDEBUG) && 0
-	printf("[");
+#if defined(PRINT_DEBUG) && 0
+	log_t("[");
 	for (bool v :
 		 {w + 5 > 9 * n,
 		  w - 5 < 13 * n,
@@ -51,8 +44,8 @@ inline bool IsFinder(int a, int b, int c, int d, int e)
 //		  c < 5 + 10 * e,
 		  a < 2 + 4 * e,
 			4 * a > n})
-		printf(" %d", v);
-	printf("]"); fflush(stdout);
+		log_t(" %d", v);
+	log_t("]");
 #endif
 	return x;
 };
@@ -79,7 +72,7 @@ inline float ModSizeFinder(const PatternView& view)
 
 inline bool IsGuard(int a, int b)
 {
-	//	printf(" (%d, %d)", a, b);
+	// log_t(" (%d, %d)", a, b);
 	return a > b * 3 / 4 - 2 && a < b * 5 / 4 + 2;
 }
 
@@ -106,6 +99,7 @@ struct Pair
 	operator bool() const noexcept { return finder != 0; }
 	bool operator==(const Pair& o) const noexcept { return finder == o.finder && left == o.left && right == o.right; }
 	bool operator!=(const Pair& o) const noexcept { return !(*this == o); }
+	int center() const { return std::midpoint(xStart, xStop); }
 };
 
 struct PairHash
@@ -119,24 +113,93 @@ struct PairHash
 constexpr int FULL_PAIR_SIZE = 8 + 5 + 8;
 constexpr int HALF_PAIR_SIZE = 8 + 5 + 2; // half has to be followed by a guard pattern
 
-template<typename T>
-int ParseFinderPattern(const PatternView& view, bool reversed, T l2rPattern, T r2lPattern)
+template<size_t E2E_LEN, size_t N>
+int ParseFinderPattern(const PatternView& view, bool reversed, const std::array<Pattern<E2E_LEN>, N>& e2ePatterns)
 {
-	constexpr float MAX_AVG_VARIANCE        = 0.2f;
-	constexpr float MAX_INDIVIDUAL_VARIANCE = 0.45f;
+	static_assert(E2E_LEN == 3);
+	const auto e2e = NormalizedE2EPattern<5, E2E_LEN>(view, 15, reversed);
 
-	int i = 1 + RowReader::DecodeDigit(view, reversed ? r2lPattern : l2rPattern, MAX_AVG_VARIANCE,
-									   MAX_INDIVIDUAL_VARIANCE, true);
+	int best_i = -1, best_e = 3;
+	for (int i = 0; i < Size(e2ePatterns); ++i) {
+		int e = 0;
+		for (int j = 0; j < 3; ++j)
+			e += std::abs(static_cast<int>(e2ePatterns[i][j]) - e2e[j]);
+		if (e < best_e) {
+			best_e = e;
+			best_i = i;
+		}
+	}
+	int i = best_e <= 1 ? 1 + best_i : 0;
 	return reversed ? -i : i;
 }
 
+template <typename T>
+struct OddEven
+{
+	T odd = {}, evn = {};
+	T& operator[](int i) { return i & 1 ? evn : odd; }
+};
+
 using Array4I = std::array<int, 4>;
+
+// elements() determines the element widths of an (n,k) character.
+// for DataBar:         LEN=8, mods=15/16
+// for DataBarExpanded: LEN=8, mods=17
+// for DataBarLimited:  LEN=14, mods=26/18
+template <int LEN>
+std::array<int, LEN> NormalizedPatternFromE2E(const PatternView& view, int mods, bool reversed = false)
+{
+	// To disambiguate the edge-to-edge measurements, it is defined that either the odd or the even-numbered
+	// elements contain at least 1 element that is 1 module wide. (Note: even-numbered elements - 2nd, 4th, 6th, etc., have odd
+	// indexes).
+	// The reference decoding algorithm in Annex G of ISO/IEC 24724:2011 is distinguishing between DataBarExpanded on one side
+	// and all other variants on the other. That seems to contradict the rest of the specification. For details see
+	// https://github.com/zxing-cpp/zxing-cpp/issues/935.
+	// Turns out the true distinction is to be made as follows:
+	//   min-even-is-one: DataBarLimited, DataBar outside character
+	//   min-odd-is-one:  DataBarExpanded, DataBar inside character
+	bool minOddIsOne = mods == 15 || mods == 17;
+	const auto e2e = NormalizedE2EPattern<LEN, LEN - 2>(view, mods, reversed);
+	std::array<int, LEN> widths;
+
+	// derive element widths from normalized edge-to-similar-edge measurements
+	int barSum = widths[0] = minOddIsOne ? 8 : 1; // first assume 1st bar is 1 / 8
+	for (int i = 0; i < Size(e2e); i++) {
+		widths[i + 1] = e2e[i] - widths[i];
+		barSum += widths[i + 1];
+	}
+	widths.back() = mods - barSum; // last even element makes mods modules
+
+	// int minEven = widths[1];
+	// for (int i = 3; i < Size(widths); i += 2)
+	// 	minEven = std::min(minEven, widths[i]);
+	OddEven<int> min = {widths[0], widths[1]};
+	for (int i = 2; i < Size(widths); i++)
+		min[i] = std::min(min[i], widths[i]);
+
+	if (minOddIsOne && min[0] > 1) {
+		// minimum odd width is too big, readjust so minimum odd is 1
+		for (int i = 0; i < Size(widths); i += 2) {
+			widths[i] -= min[0] - 1;
+			widths[i + 1] += min[0] - 1;
+		}
+	} else if (!minOddIsOne && min[1] > 1) {
+		// minimum even width is too big, readjust so minimum even is 1
+		for (int i = 0; i < Size(widths); i += 2) {
+			widths[i] += min[1] - 1;
+			widths[i + 1] -= min[1] - 1;
+		}
+	}
+
+	return widths;
+}
 
 bool ReadDataCharacterRaw(const PatternView& view, int numModules, bool reversed, Array4I& oddPattern,
 						  Array4I& evnPattern);
 
-int GetValue(const Array4I& widths, int maxWidth, bool noNarrow);
+int GetValue(ArrayView<int> widths, int maxWidth, bool noNarrow);
 
 Position EstimatePosition(const Pair& first, const Pair& last);
+int EstimateLineCount(const Pair& first, const Pair& last);
 
 } // namespace ZXing::OneD::DataBar

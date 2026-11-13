@@ -1,30 +1,18 @@
 /*
 * Copyright 2016 Nu-book Inc.
 * Copyright 2017 Axel Waggershauser
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*      http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
 */
+// SPDX-License-Identifier: Apache-2.0
 
 #include "BlackboxTestRunner.h"
 #include "ImageLoader.h"
-#include "TextUtfEncoding.h"
-#include "ZXContainerAlgorithms.h"
-#include "ZXFilesystem.h"
+#include "ReadBarcode.h"
+#include "StdPrint.h"
+#include "ZXAlgorithms.h"
 
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iostream>
 #include <set>
 
 using namespace ZXing;
@@ -33,45 +21,54 @@ using namespace ZXing::Test;
 int getEnv(const char* name, int fallback = 0)
 {
 	auto var = getenv(name);
-	return var ? atoi(var) : fallback;
+	return var ? std::stoi(var) : fallback;
 }
 
 int main(int argc, char** argv)
 {
 	if (argc <= 1) {
-		std::cout << "Usage: " << argv[0] << " <test_path_prefix>" << std::endl;
+		std::println("Usage: {} <test_path_prefix> [test_name_prefix,...]", argv[0]);
 		return 0;
 	}
 
-	fs::path pathPrefix = argv[1];
+	if (fs::is_directory(argv[1])) {
+		std::set<std::string> includedTests;
+		for (int i = 2; i < argc; ++i)
+			includedTests.insert(argv[i]);
 
-	if (Contains({".png", ".jpg", ".pgm", ".gif"}, pathPrefix.extension())) {
-		auto hints = DecodeHints().setTryHarder(!getEnv("FAST", false)).setTryRotate(true).setIsPure(getEnv("IS_PURE"));
+		try {
+			return runBlackBoxTests(argv[1], includedTests);
+		} catch (const std::exception& e) {
+			std::println("{}", e.what());
+		}
+		return -1;
+	} else {
+		auto opts = ReaderOptions().tryHarder(!getEnv("FAST", false)).tryDownscale(false).isPure(getEnv("IS_PURE"));
 		if (getenv("FORMATS"))
-			hints.setFormats(BarcodeFormatsFromString(getenv("FORMATS")));
+			opts.formats(BarcodeFormatsFromString(getenv("FORMATS")));
 		int rotation = getEnv("ROTATION");
 
 		for (int i = 1; i < argc; ++i) {
-			Result result = ReadBarcode(ImageLoader::load(argv[i]).rotated(rotation), hints);
-			std::cout << argv[i] << ": ";
-			if (result.isValid())
-				std::cout << ToString(result.format()) << ": " << TextUtfEncoding::ToUtf8(result.text()) << "\n";
+			if (!Contains({".png", ".jpg", ".jpeg", ".pgm", ".gif", ".webp", ".jxl"}, fs::path(argv[i]).extension()))
+				continue;
+
+			Barcode barcode = ReadBarcode(ImageLoader::load(argv[i]).rotated(rotation), opts);
+			std::print("{}: ", argv[i]);
+			if (barcode.isValid())
+				std::println("{}: {}", EnumName(barcode.format()), barcode.text());
 			else
-				std::cout << "FAILED\n";
-			if (result.isValid() && getenv("WRITE_TEXT")) {
-				std::ofstream f(fs::path(argv[i]).replace_extension(".txt"));
-				f << TextUtfEncoding::ToUtf8(result.text());
+				std::println("FAILED");
+			if (barcode.isValid() && getenv("WRITE_TOML")) {
+				std::ofstream f(fs::path(argv[i]).replace_extension(".toml"));
+				f << std::format("Format = \"{}\"\n", ToString(barcode.format()));
+				if (barcode.contentType() == ContentType::Binary)
+					f << std::format("TextHex = \"{}\"\n", barcode.text(TextMode::Hex));
+				else
+					f << std::format("TextPlain = \"{}\"\n", barcode.text(TextMode::Plain));
+				f << std::format("UEC = \"{}\"\n", barcode.extra(BarcodeExtra::UEC));
+				f << std::format("\nfind = \"sa fa\"\n");
 			}
 		}
 		return 0;
-	} else {
-		std::set<std::string> includedTests;
-		for (int i = 2; i < argc; ++i) {
-			if (std::strlen(argv[i]) > 2 && argv[i][0] == '-' && argv[i][1] == 't') {
-				includedTests.insert(argv[i] + 2);
-			}
-		}
-
-		return runBlackBoxTests(pathPrefix, includedTests);
 	}
 }
